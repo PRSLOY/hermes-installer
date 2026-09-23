@@ -1,0 +1,40 @@
+{
+  "providers": [
+    {
+      "id": "gwarden",
+      "label": "GWarden — рекомендуем (7 дней бесплатно)",
+      "endpoint": "https://gwarden.su/v1",
+      "model": "glm-5.3",
+      "note": "Ключ — в личном кабинете gwarden.su или в Telegram-боте @GwardenAIBot (кнопка «Get API»). Ключ выглядит как GWAR-XXXX.",
+      "key_url": "https://gwarden.su/cabinet?ref=1ROA74D4OH"
+    },
+    {
+      "id": "dahl",
+      "label": "Dahl — бесплатно 100 млн токенов",
+      "endpoint": "https://inference.dahl.global/v1",
+      "model": "MiniMaxAI/MiniMax-M2.7",
+      "note": "Create account → в окне «Save your fingerprint» нажмите Download as .txt: это пароль, его не восстановить. Там же API key (dahl_…).\nВажно: у ключа нажмите Allocate → Max → Allocate, иначе на нём 0 токенов.",
+      "key_url": "https://inference.dahl.global/account"
+    },
+    {
+      "id": "atria",
+      "label": "Atria — 100 млн токенов, агентная модель",
+      "endpoint": "https://api.atria-asi.ai/v1",
+      "model": "Atria-Dawn-Preview",
+      "note": "Ключ — на api.atria-asi.ai в разделе Console (вид atr_…). Модель думает перед ответом: чуть медленнее, зато хорошо работает с инструментами.",
+      "key_url": "https://api.atria-asi.ai/console"
+    },
+    {
+      "id": "inception",
+      "label": "Inception Mercury — очень быстрая",
+      "endpoint": "https://api.inceptionlabs.ai/v1",
+      "model": "mercury-2.5",
+      "note": "Ключ — на platform.inceptionlabs.ai (вид sk_…). Отвечает примерно за секунду; для сложных задач надёжнее GWarden или Atria.",
+      "key_url": "https://platform.inceptionlabs.ai/"
+    },
+    {
+      "id": "custom",
+      "label": "Другой (точный адрес API)"
+    }
+  ]
+}

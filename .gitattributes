@@ -1,0 +1,4 @@
+# Hash-pinned upstream files: never let git rewrite line endings.
+backend/upstream/** -text
+dist/backend/upstream/** -text
+*.exe binary

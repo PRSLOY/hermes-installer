@@ -1,0 +1,11 @@
+qa/final-outputs*/
+qa/outputs/
+qa/e2e-outputs/
+qa/candidate-dist*/
+esp32-c6-sensor-node/
+.pytest_cache/
+__pycache__/
+*.pyc
+.scratch/
+qa/ui-run/
+qa/diag-out/
