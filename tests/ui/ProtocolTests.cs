@@ -144,6 +144,89 @@ public static class UnitTests
         Check(new Request { endpoint = "http://x", api_key = "TESTKEY123" }.Validate() != null, "request validation rejects http endpoint");
         Check(new Request { endpoint = "https://x/v1", api_key = "ключ с пробелом" }.Validate() != null, "request validation rejects space in key");
         Check(new Request { endpoint = "https://x/v1", api_key = "TESTKEY123" }.Validate() == null, "request validation accepts well-formed request");
+        FallbackTests(catalogPath);
         return Environment.ExitCode;
+    }
+
+    // --- backup providers (issue #10) ------------------------------------------------
+    static string Shown(System.Windows.Forms.ComboBox combo) { return combo.SelectedItem == null ? null : combo.SelectedItem.ToString(); }
+    static Request WithBackups(params FallbackEntry[] entries)
+    {
+        return new Request { endpoint = "https://primary.test/v1", api_key = "TESTKEY123", fallbacks = new System.Collections.Generic.List<FallbackEntry>(entries) };
+    }
+    static FallbackEntry Fb(string id, string endpoint, string key)
+    {
+        return new FallbackEntry { provider_id = id, endpoint = endpoint, model = "m-1", api_key = key };
+    }
+    static void FallbackTests(string catalogPath)
+    {
+        var ok = WithBackups(Fb("dahl", " dahl.test/v1/ ", "BACKUP KEY 123"), Fb("atria", "https://atria.test/v1", "BACKUPKEY456"));
+        Check(ok.Validate() == null, "two well-formed backups are accepted");
+        Check(ok.fallbacks[0].endpoint == "https://dahl.test/v1" && ok.fallbacks[0].api_key == "BACKUPKEY123", "backup endpoint normalized and key whitespace cleaned like the primary");
+        Check(WithBackups().Validate() == null && new Request { endpoint = "https://x/v1", api_key = "TESTKEY123", fallbacks = null }.Validate() == null, "no backups is valid");
+        Check(WithBackups(Fb("a", "https://a.test/v1", "BACKUPKEY1"), Fb("b", "https://b.test/v1", "BACKUPKEY2"), Fb("c", "https://c.test/v1", "BACKUPKEY3")).Validate() != null, "more than two backups rejected");
+        Check(WithBackups(Fb("dahl", "https://a.test/v1", "BACKUPKEY1"), Fb("dahl", "https://b.test/v1", "BACKUPKEY2")).Validate() != null, "duplicate backup provider rejected");
+        Check(WithBackups(Fb("a", "https://a.test/v1", "BACKUPKEY1"), Fb("b", "https://A.test/v1/", "BACKUPKEY2")).Validate() != null, "duplicate backup endpoint rejected");
+        Check(WithBackups(Fb("p", "https://PRIMARY.test/v1/", "BACKUPKEY1")).Validate() != null, "backup equal to the primary endpoint rejected");
+        Check(WithBackups(Fb("a", "http://a.test/v1", "BACKUPKEY1")).Validate() != null, "http backup endpoint rejected");
+        Check(WithBackups(Fb("a", "https://a.test", "BACKUPKEY1")).Validate() != null, "backup website address (no API path) rejected");
+        Check(WithBackups(Fb("a", "https://a.test/v1", "short")).Validate() != null, "short backup key rejected");
+        Check(WithBackups(Fb("a", "https://a.test/v1", "ключ-кириллицей")).Validate() != null, "non-ASCII backup key rejected");
+        Check(WithBackups(Fb("bad id", "https://a.test/v1", "BACKUPKEY1")).Validate() != null, "malformed provider id rejected");
+        Check(WithBackups((FallbackEntry)null).Validate() != null, "null backup entry rejected");
+        var redact = new Protocol("TESTSECRET123", delegate { }, delegate { return true; }) { ExtraSecrets = ok.Secrets() };
+        Check(!redact.SafeText("x BACKUPKEY456 y").Contains("BACKUPKEY456"), "backup keys are redacted from backend text");
+        ok.ClearSecrets();
+        Check(ok.api_key == null && ok.fallbacks[0].api_key == null && ok.fallbacks[1].api_key == null, "ClearSecrets drops every key");
+
+        File.WriteAllText(catalogPath, "{\"providers\":[" +
+            "{\"id\":\"gwarden\",\"label\":\"GWarden — рекомендуем\",\"endpoint\":\"https://gwarden.su/v1\",\"model\":\"glm-5.3\"}," +
+            "{\"id\":\"dahl\",\"label\":\"Dahl — бесплатно\",\"endpoint\":\"https://inference.dahl.global/v1\",\"model\":\"MiniMaxAI/MiniMax-M2.7\"}," +
+            "{\"id\":\"atria\",\"label\":\"Atria\",\"endpoint\":\"https://api.atria-asi.ai/v1\",\"model\":\"Atria-Dawn-Preview\"}," +
+            "{\"id\":\"custom\",\"label\":\"Другой (точный адрес API)\"}]}");
+        try { using (var form = new InstallerForm()) {
+            form.ApiKey.Text = "PRIMARYKEY123";
+            Check(form.BuildRequest().fallbacks == null && form.BackupCount == 0 && form.BackupSummary == "Добавить запасной ключ (необязательно)", "backups are off by default; the key screen shows only the link");
+            var ids = new System.Collections.Generic.List<string>();
+            foreach (var p in form.BackupCandidates()) ids.Add(p.id);
+            Check(String.Join(",", ids.ToArray()) == "dahl,atria", "backup list excludes custom and the primary");
+            using (var d = form.CreateBackupDialog()) {
+                Check(d.RowCount == 1 && Shown(d.Providers[0]) == "Dahl", "dialog opens with one row on the first remaining provider (short name)");
+                Check(d.TryAccept() != null && d.ErrorText.Contains("1") && d.Result == null, "an empty key is reported inside the dialog");
+                d.Keys[0].Text = "BACKUP KEY111";
+                d.AddRow();
+                Check(d.RowCount == 2 && Shown(d.Providers[1]) == "Atria", "«Ещё один» opens row 2 on a provider row 1 does not use");
+                d.AddRow();
+                Check(d.RowCount == 2, "never more than two rows");
+                d.Keys[1].Text = "short";
+                Check(d.TryAccept() != null && d.ErrorText.StartsWith("Запасной ключ 2"), "bad backup key is reported inside the dialog");
+                d.Keys[1].Text = "BACKUPKEY222";
+                d.Providers[1].SelectedIndex = d.Providers[0].SelectedIndex;
+                Check(d.TryAccept() != null && d.ErrorText.Length > 0, "the same provider twice is rejected inside the dialog");
+                d.Providers[1].SelectedIndex = 1;
+                Check(d.TryAccept() == null && d.ErrorText == "", "valid rows are accepted");
+                form.ApplyBackupDialog(d);
+            }
+            Check(form.BackupSummary == "Запасные: Dahl, Atria · изменить", "after ОК the link becomes a one-line summary");
+            var request = form.BuildRequest();
+            Check(request.Validate() == null && request.fallbacks.Count == 2 && request.fallbacks[0].provider_id == "dahl" &&
+                  request.fallbacks[0].endpoint == "https://inference.dahl.global/v1" && request.fallbacks[0].model == "MiniMaxAI/MiniMax-M2.7" &&
+                  request.fallbacks[0].api_key == "BACKUPKEY111" && request.fallbacks[1].api_key == "BACKUPKEY222", "BuildRequest carries both backups with preset endpoint, model and cleaned key");
+            using (var d = form.CreateBackupDialog()) {
+                Check(d.RowCount == 2 && d.Keys[0].Text == "BACKUPKEY111" && Shown(d.Providers[1]) == "Atria", "«изменить» reopens the dialog with the entered values");
+                d.RemoveRow(0);
+                Check(d.RowCount == 1 && Shown(d.Providers[0]) == "Atria" && d.Keys[0].Text == "BACKUPKEY222" && d.Keys[1].TextLength == 0, "«Убрать» drops a row and moves the next one up");
+                // Cancel = the dialog result is simply not applied.
+            }
+            Check(form.BackupCount == 2, "Отмена keeps the previous backups");
+            form.ToggleModelField(); form.ToggleTelegramField();
+            Check(form.TelegramShown && form.BackupCount == 2, "model and Telegram panels work as before alongside backups");
+            form.ToggleTelegramField(); form.ToggleModelField();
+            form.SelectProvider(1);
+            Check(form.BackupCount == 1 && form.BackupSummary == "Запасные: Atria · изменить", "a backup that becomes the primary is dropped");
+            form.SelectProvider(0);
+            using (var d = form.CreateBackupDialog()) { d.RemoveRow(0); Check(d.RowCount == 0 && d.TryAccept() == null, "zero rows + ОК = no backups"); form.ApplyBackupDialog(d); }
+            Check(form.BackupCount == 0 && form.BuildRequest().fallbacks == null, "removing every row turns backups off");
+        }} finally { File.Delete(catalogPath); }
     }
 }

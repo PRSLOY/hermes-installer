@@ -16,6 +16,13 @@ from backend import provider
 
 
 class TransportErrorTests(unittest.TestCase):
+    def setUp(self):
+        self._pauses = provider.RETRY_PAUSES
+        provider.RETRY_PAUSES = (0, 0)   # no real sleeping in tests
+
+    def tearDown(self):
+        provider.RETRY_PAUSES = self._pauses
+
     def _open_raises(self, exc):
         opener = mock.Mock()
         opener.open = mock.Mock(side_effect=exc)

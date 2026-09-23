@@ -65,6 +65,20 @@ class LayoutTests {
   return max;
  }
 
+ static void Settle(Form f) { Application.DoEvents(); f.PerformLayout(); Application.DoEvents(); }
+ static void CheckKeyPage(Form f,Control page,int footerTop,string where) {
+  int bottom=MaxBottom(page,f);
+  Require(bottom<=footerTop, where+": content overlaps the footer ("+bottom+" > "+footerTop+")");
+  Require(!AnyAutoScroll(f), where+": scrollbar appeared");
+  CheckInside(f,f,where);
+ }
+ static void Snap(Form f,string dir,string name) {
+  using(var image=new Bitmap(f.Width,f.Height)) {
+   f.DrawToBitmap(image,new Rectangle(Point.Empty,f.Size));
+   image.Save(Path.Combine(dir,name+".png"));
+  }
+ }
+
  [STAThread] static int Main(string[] args) {
   Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
   try {
@@ -115,6 +129,25 @@ class LayoutTests {
         Require(!AnyAutoScroll(f), tag+" key screen, provider "+f.PresetAt(p).id+": scrollbar appeared");
         CheckInside(f,f,tag+" key screen "+f.PresetAt(p).id);
        }
+       // Backup providers (issue #10): after ОК in the dialog the key screen shows only a
+       // one-line summary ("Запасные: A, B · изменить") on the model link's line. For every
+       // primary provider, with the most rows the catalog allows, it must stay above the footer.
+       for(int p=0;p<f.ProviderCount;p++) {
+        f.SelectProvider(p); Settle(f);
+        string where=tag+" key screen backup summary, provider "+f.PresetAt(p).id;
+        if(f.BackupCandidates().Count==0) continue;
+        using(var d=f.CreateBackupDialog()) {
+         d.AddRow();
+         for(int r=0;r<d.RowCount;r++) d.Keys[r].Text="LAYOUTFAKEKEY"+r;
+         Require(d.TryAccept()==null, where+": dialog did not accept two fake keys: "+d.ErrorText);
+         f.ApplyBackupDialog(d);
+        }
+        Settle(f);
+        Require(f.BackupCount>0 && f.BackupSummary.StartsWith("Запасные: "), where+": summary line missing");
+        CheckKeyPage(f,pageCtl[0],footerTop,where);
+        if(p==1) Snap(f,dir,"screen2-key-backup-"+tag);
+        f.ClearBackups(); Settle(f);
+       }
        f.SelectProvider(0); Application.DoEvents(); f.PerformLayout(); Application.DoEvents();
       }
       if(page==InstallerForm.PageDone) {
@@ -153,7 +186,35 @@ class LayoutTests {
      f.Close();
     }
    }
-   Console.WriteLine("PASS layout: 4 screens x 6 sizes, nothing clipped, no in-window scrollbars, log scroll preserved; scaling is SIMULATED, not OS DPI.");
+   // The backup dialog itself at 100/150/200%: two rows plus a validation error, nothing
+   // clipped, content above its footer, no scrollbar.
+   foreach(float scale in new[]{1f,1.5f,2f}) {
+    string tag="dialog-"+scale.ToString(CultureInfo.InvariantCulture);
+    string catalog=Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"providers.json");
+    var presets=ProviderCatalog.Load(catalog);
+    var candidates=new List<ProviderPreset>();
+    for(int i=1;i<presets.Length;i++) if(!presets[i].IsCustom) candidates.Add(presets[i]);
+    using(var d=new BackupKeysDialog(candidates,null,presets[0].endpoint)) {
+     d.AutoScaleMode=AutoScaleMode.None;
+     if(scale!=1) { d.Scale(new SizeF(scale,scale)); ScaleFonts(d,scale); }
+     d.Show(); Settle(d);
+     d.AddRow();
+     d.Keys[0].Text="LAYOUTFAKEKEY0"; d.Keys[1].Text="short";
+     Require(d.TryAccept()!=null, tag+": a short key must be rejected");
+     Settle(d);
+     Require(d.RowCount==2, tag+": two rows expected");
+     var content=d.Controls.Find("DialogContent",true); var footer=d.Controls.Find("DialogFooter",true);
+     Require(content.Length==1 && footer.Length==1, tag+": dialog content and footer present");
+     int footerTop=d.PointToClient(footer[0].PointToScreen(Point.Empty)).Y;
+     int bottom=MaxBottom(content[0],d);
+     Require(bottom<=footerTop, tag+": dialog content overlaps its footer ("+bottom+" > "+footerTop+")");
+     Require(!AnyAutoScroll(d), tag+": scrollbar appeared in the dialog");
+     CheckInside(d,d,tag);
+     Snap(d,dir,"backup-"+tag);
+     d.Close();
+    }
+   }
+   Console.WriteLine("PASS layout: 4 screens x 6 sizes, key screen with the backup summary per provider, backup dialog at 3 scales, nothing clipped, no in-window scrollbars, log scroll preserved; scaling is SIMULATED, not OS DPI.");
    return 0;
   } catch(Exception e) { Console.Error.WriteLine(e); return 1; }
  }

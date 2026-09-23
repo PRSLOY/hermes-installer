@@ -8,13 +8,24 @@ using System.Web.Script.Serialization;
 
 namespace HermesSetup
 {
+    // One optional backup provider (issue #10). Hermes switches to it by itself when
+    // the primary fails (fallback_providers). The key goes only to backend\fallbacks.py.
+    public sealed class FallbackEntry
+    {
+        public string provider_id, endpoint, model, api_key;
+    }
     public sealed class Request
     {
+        public const int MaxFallbacks = 2;
         public int protocol = 1;
         public string action = "install";
         public string endpoint, api_key, model, provider_name;
         // Optional; null/empty = Telegram skipped. Never logged or shown back.
         public string telegram_bot_token;
+        // Optional; null/empty = no backup providers. 0-2 entries, keys never shown back.
+        public List<FallbackEntry> fallbacks;
+        public static readonly System.Text.RegularExpressions.Regex ProviderIdShape =
+            new System.Text.RegularExpressions.Regex("^[A-Za-z0-9_.-]{1,64}$", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
         public static readonly System.Text.RegularExpressions.Regex TelegramTokenShape =
             new System.Text.RegularExpressions.Regex("^[0-9]{1,20}:[A-Za-z0-9_-]{30,64}$", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
         public static string NormalizeEndpoint(string raw)
@@ -50,7 +61,50 @@ namespace HermesSetup
                 if (telegram_bot_token != null && !TelegramTokenShape.IsMatch(telegram_bot_token))
                     return "Токен Телеграм-бота выглядит неверно. Скопируйте его из @BotFather целиком (вида 123456789:AA…) или оставьте поле пустым.";
             }
+            return ValidateFallbacks();
+        }
+        // Backup keys follow the primary's rules. Short messages: they must fit the one
+        // error line of the key screen while the backup rows are open (560x500 budget).
+        public string ValidateFallbacks()
+        {
+            if (fallbacks == null) return null;
+            if (fallbacks.Count > MaxFallbacks) return "Можно добавить не больше двух запасных ключей.";
+            var ids = new HashSet<string>(StringComparer.Ordinal);
+            var endpoints = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            endpoints.Add(endpoint);
+            for (int i = 0; i < fallbacks.Count; i++)
+            {
+                FallbackEntry entry = fallbacks[i];
+                string n = (i + 1).ToString();
+                if (entry == null || entry.provider_id == null || !ProviderIdShape.IsMatch(entry.provider_id))
+                    return "Запасной ключ " + n + ": выберите провайдера.";
+                entry.endpoint = NormalizeEndpoint(entry.endpoint);
+                var probe = new Request { endpoint = entry.endpoint, api_key = "VALIDATION-ONLY" };
+                if (probe.Validate() != null) return "Запасной провайдер " + n + ": неверный адрес API.";
+                string original = entry.api_key;
+                var keyProbe = new Request { endpoint = entry.endpoint, api_key = original };
+                if (keyProbe.Validate() != null) return "Запасной ключ " + n + ": от 8 до 8192 символов, без пробелов.";
+                entry.api_key = keyProbe.api_key;
+                if (entry.model != null && entry.model.Length > 256) return "Запасной провайдер " + n + ": слишком длинное имя модели.";
+                if (entry.model != null) foreach (char c in entry.model) if (c < 32) return "Запасной провайдер " + n + ": неверное имя модели.";
+                if (!ids.Add(entry.provider_id)) return "Запасной провайдер " + n + " уже выбран. Выберите другой.";
+                if (!endpoints.Add(entry.endpoint)) return "Запасной провайдер " + n + " совпадает с основным или другим.";
+            }
             return null;
+        }
+        // Every key this request carries: redacted from any text the backend sends back.
+        public string[] Secrets()
+        {
+            var list = new List<string>();
+            if (!String.IsNullOrEmpty(api_key)) list.Add(api_key);
+            if (!String.IsNullOrEmpty(telegram_bot_token)) list.Add(telegram_bot_token);
+            if (fallbacks != null) foreach (var f in fallbacks) if (f != null && !String.IsNullOrEmpty(f.api_key)) list.Add(f.api_key);
+            return list.ToArray();
+        }
+        public void ClearSecrets()
+        {
+            api_key = null; telegram_bot_token = null;
+            if (fallbacks != null) foreach (var f in fallbacks) if (f != null) f.api_key = null;
         }
     }
     public static class WorkerClient
@@ -104,6 +158,7 @@ namespace HermesSetup
             if(error!=null) return Outcome.Failure(error);
             if(!File.Exists(worker)) return Outcome.Failure("INSTALL: Не найден backend/worker.ps1. Распакуйте весь ZIP в одну папку и запустите HermesSetup.exe оттуда.");
             var protocol = new Protocol(request.api_key,progress,validator);
+            protocol.ExtraSecrets = request.Secrets();
             if (stage != null) protocol.StageProgress = stage;
             using(var process = new Process { StartInfo=StartInfo(worker) })
             {

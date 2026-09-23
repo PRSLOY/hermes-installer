@@ -87,6 +87,23 @@ public static class E2eTests
                 delegate(string p, string[] a) { return true; /* SIMULATION: permissive validator */ }).GetAwaiter().GetResult();
             Check(echoOutcome.Success && echoOutcome.Message=="fields-ok", "request JSON fields arrive intact at backend (stdin protocol) got="+echoOutcome.Message);
 
+            // 5b. Backup providers (issue #10) arrive as a JSON array of objects on stdin.
+            string fbWorker = WriteWorker(Path.Combine(temp, "fallbacks", "backend"), "$ErrorActionPreference='Stop'\r\n" +
+                "$utf8 = New-Object System.Text.UTF8Encoding($false)\r\n[Console]::InputEncoding=$utf8\r\n[Console]::OutputEncoding=$utf8\r\n$OutputEncoding=$utf8\r\n" +
+                "$raw = [Console]::In.ReadToEnd().TrimStart([char]0xFEFF)\r\n" +
+                "$p = $null; try { $p = $raw | ConvertFrom-Json } catch { $p = $null }\r\n" +
+                // Plain assignment: `$f = if (...) { @(...) }` unrolls a one-element array into a
+                // bare PSCustomObject, which has no .Count in PowerShell 5.1.
+                "$f = @(); if ($null -ne $p) { $f = @($p.fallbacks) }\r\n" +
+                "$ok = ($f.Count -eq 1 -and $f[0].provider_id -eq 'dahl' -and $f[0].endpoint -eq 'https://dahl.mock.test/v1' -and $f[0].model -eq 'm-1' -and $f[0].api_key -eq 'MOCKBACKUP123')\r\n" +
+                "$msg = if ($ok) { 'fallbacks-ok' } else { 'fallbacks-bad' }\r\n" +
+                "[Console]::Out.WriteLine('{\"type\":\"success\",\"message\":\"' + $msg + '\",\"launch_path\":\"C:\\\\mock\\\\hermes.exe\",\"launch_args\":[]}')\r\nexit 0\r\n");
+            var fbRequest = new Request { endpoint="https://mock.test/v1", api_key="MOCKKEY12345",
+                fallbacks = new List<FallbackEntry> { new FallbackEntry { provider_id="dahl", endpoint="https://dahl.mock.test/v1", model="m-1", api_key="MOCKBACKUP123" } } };
+            var fbOutcome = WorkerClient.RunAsync(fbWorker, fbRequest, delegate { },
+                delegate(string p, string[] a) { return true; /* SIMULATION: permissive validator */ }).GetAwaiter().GetResult();
+            Check(fbOutcome.Success && fbOutcome.Message=="fallbacks-ok", "backup providers arrive intact at backend (stdin protocol) got="+fbOutcome.Message);
+
             // 6. Missing worker script: actionable INSTALL failure, not a crash.
             var missing = WorkerClient.RunAsync(Path.Combine(temp, "absent", "backend", "worker.ps1"), new Request { endpoint="https://mock.test/v1", api_key="MOCKKEY12345" }, delegate { }).GetAwaiter().GetResult();
             Check(!missing.Success && missing.Message.Contains("backend"), "missing worker script produces actionable error");

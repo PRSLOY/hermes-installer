@@ -14,7 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 PS_FILES = ['backend/worker.ps1', 'backend/checkpoint.ps1', 'backend/streaming.ps1', 'backend/protect.ps1']
-PY_FILES = ['backend/configure.py', 'backend/provider.py']
+PY_FILES = ['backend/configure.py', 'backend/provider.py', 'backend/fallbacks.py']
 CYRILLIC = re.compile(r'[\u0400-\u04FF]')
 LATIN_WORD = re.compile(r'[A-Za-z]{3,}')
 QUOTED = re.compile(r"'([^']*)'|\"([^\"]*)\"")

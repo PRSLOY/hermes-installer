@@ -16,7 +16,7 @@ Copy-Item -LiteralPath (Join-Path $root 'providers.json.template') (Join-Path $d
 
 # 3. Backend: worker + helpers only. upstream install.ps1 verified by checksum at runtime.
 [void][IO.Directory]::CreateDirectory((Join-Path $dist 'backend'))
-foreach ($name in @('worker.ps1','streaming.ps1','checkpoint.ps1','protect.ps1','configure.py','provider.py','extras.py','telegram.py')) {
+foreach ($name in @('worker.ps1','streaming.ps1','checkpoint.ps1','protect.ps1','configure.py','provider.py','extras.py','telegram.py','fallbacks.py')) {
     Copy-Item -LiteralPath (Join-Path $root "backend\$name") (Join-Path $dist "backend\$name") -Force
 }
 [void][IO.Directory]::CreateDirectory((Join-Path $dist 'backend\upstream'))

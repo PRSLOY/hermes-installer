@@ -54,6 +54,11 @@ namespace HermesSetup
         readonly Label telegramLink = new Label { Name = "TelegramLink", Text = "Подключить Телеграм (необязательно)", AutoSize = true, ForeColor = UiTheme.Accent, Cursor = Cursors.Hand, Font = UiTheme.Font(9.5f, FontStyle.Underline), Margin = new Padding(0, 8, 0, 0) };
         readonly TableLayoutPanel telegramPanel = new TableLayoutPanel { Name = "TelegramPanel", Visible = false, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Top, ColumnCount = 1, RowCount = 2, BackColor = UiTheme.Background };
         bool telegramVisible;
+        // Optional backup providers (issue #10): chosen in BackupKeysDialog; the key screen
+        // shows only this link, or after ОК a one-line summary that reopens the dialog.
+        // It shares the model link's line (wraps below it only when it does not fit).
+        readonly Label backupLink = new Label { Name = "BackupLink", Text = "Добавить запасной ключ (необязательно)", AutoSize = true, ForeColor = UiTheme.Accent, Cursor = Cursors.Hand, Font = UiTheme.Font(9.5f, FontStyle.Underline), Margin = Padding.Empty };
+        System.Collections.Generic.List<BackupSelection> backups = new System.Collections.Generic.List<BackupSelection>();
         // Done screen: owner approval step (shown only when the bot is connected).
         readonly TableLayoutPanel tgStep = new TableLayoutPanel { Name = "TelegramStep", Visible = false, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Top, ColumnCount = 1, RowCount = 5, BackColor = UiTheme.Background, Margin = new Padding(0, 6, 0, 0) };
         readonly Label tgStepText = new Label { Name = "TelegramStepText", AutoSize = true, Tag = "wrap", ForeColor = UiTheme.Text, Font = UiTheme.Font(10.5f), Margin = new Padding(0, 2, 0, 6) };
@@ -117,6 +122,68 @@ namespace HermesSetup
             telegramPanel.Visible = telegramVisible;
             telegramLink.Text = telegramVisible ? "Не подключать Телеграм" : "Подключить Телеграм (необязательно)";
             if (!telegramVisible) TelegramToken.Clear();
+            UpdateWraps();
+        }
+
+        // --- backup providers (issue #10) ---------------------------------------
+        public int BackupCount { get { return backups.Count; } }
+        public string BackupSummary { get { return backupLink.Text; } }
+        string PrimaryEndpoint
+        {
+            get
+            {
+                ProviderPreset primary = SelectedPreset;
+                if (primary == null) return "";
+                return primary.IsCustom ? Request.NormalizeEndpoint(Endpoint.Text) : primary.endpoint;
+            }
+        }
+        // Presets a backup may use: never "Другой", never the current primary.
+        public System.Collections.Generic.List<ProviderPreset> BackupCandidates()
+        {
+            var list = new System.Collections.Generic.List<ProviderPreset>();
+            ProviderPreset primary = SelectedPreset;
+            string primaryEndpoint = PrimaryEndpoint;
+            foreach (var card in cards)
+            {
+                ProviderPreset p = card.Preset;
+                if (p.IsCustom || p == primary || String.IsNullOrEmpty(p.endpoint)) continue;
+                if (String.Equals(p.endpoint, primaryEndpoint, StringComparison.OrdinalIgnoreCase)) continue;
+                list.Add(p);
+            }
+            return list;
+        }
+        // Production opens it modally; tests drive the same object without showing it.
+        public BackupKeysDialog CreateBackupDialog()
+        {
+            return new BackupKeysDialog(BackupCandidates(), backups, PrimaryEndpoint);
+        }
+        public void ApplyBackupDialog(BackupKeysDialog dialog)
+        {
+            if (dialog == null || dialog.Result == null) return;
+            backups = new System.Collections.Generic.List<BackupSelection>(dialog.Result);
+            RefreshBackupLink();
+        }
+        void OpenBackupDialog()
+        {
+            if (running) return;
+            using (var dialog = CreateBackupDialog())
+                if (dialog.ShowDialog(this) == DialogResult.OK) ApplyBackupDialog(dialog);
+        }
+        public void ClearBackups()
+        {
+            foreach (var b in backups) b.Key = null;
+            backups.Clear();
+            RefreshBackupLink();
+        }
+        // A backup can never become the primary: drop any that now are, then redraw the link.
+        void RefreshBackupLink()
+        {
+            var allowed = BackupCandidates();
+            backups.RemoveAll(delegate(BackupSelection b) { return b == null || !allowed.Contains(b.Preset); });
+            var names = new System.Collections.Generic.List<string>();
+            foreach (var b in backups) names.Add(BackupKeysDialog.ShortName(b.Preset));
+            backupLink.Text = names.Count == 0 ? "Добавить запасной ключ (необязательно)" : "Запасные: " + String.Join(", ", names.ToArray()) + " · изменить";
+            backupLink.Visible = allowed.Count > 0;
             UpdateWraps();
         }
 
@@ -206,7 +273,7 @@ namespace HermesSetup
             {
                 if (running) { e.Cancel = true; MessageBox.Show(this, "Установка ещё выполняется. Закрытие сейчас может оставить незавершённые изменения. Дождитесь результата; окно остаётся доступным.", "Установка продолжается", MessageBoxButtons.OK, MessageBoxIcon.Information); }
             };
-            FormClosed += delegate { timer.Dispose(); ApiKey.Clear(); TelegramToken.Clear(); };
+            FormClosed += delegate { timer.Dispose(); ApiKey.Clear(); TelegramToken.Clear(); ClearBackups(); };
 
             SelectProvider(0);
             GoTo(PageChoose);
@@ -330,7 +397,12 @@ namespace HermesSetup
             keySafety.Text = "Ключ хранится только на этом компьютере и не попадает в журнал. Никому его не отправляйте.";
             root.Controls.Add(keySafety, 0, 4);
             root.Controls.Add(KeyError, 0, 5);
-            root.Controls.Add(modelLink, 0, 6);
+            // Model link and backup link on one wrapping line: no extra row in the common case.
+            var links = new FlowLayoutPanel { Name = "KeyLinks", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = true, Dock = DockStyle.Top, BackColor = UiTheme.Background, Margin = modelLink.Margin, Tag = "wrap" };
+            modelLink.Margin = new Padding(0, 0, 16, 0);
+            links.Controls.Add(modelLink);
+            links.Controls.Add(backupLink);
+            root.Controls.Add(links, 0, 6);
 
             modelPanel.ColumnStyles.Clear(); modelPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             modelPanel.Controls.Add(new Label { Text = "Идентификатор модели", AutoSize = true, ForeColor = UiTheme.Text, Margin = new Padding(0, 6, 0, 4) }, 0, 0);
@@ -357,6 +429,7 @@ namespace HermesSetup
 
             modelLink.Click += delegate { ToggleModelField(); };
             telegramLink.Click += delegate { ToggleTelegramField(); };
+            backupLink.Click += delegate { OpenBackupDialog(); };
             page.Controls.Add(root);
             return page;
         }
@@ -483,6 +556,7 @@ namespace HermesSetup
             if (custom) { EndpointPreview.Text = ""; ConfirmEndpoint.Checked = false; ConfirmEndpoint.Enabled = false; }
             string note = cards[index].Preset.note;
             keyHint.Text = String.IsNullOrEmpty(note) ? "" : note;
+            RefreshBackupLink();
             RefreshButtons();
         }
 
@@ -515,6 +589,11 @@ namespace HermesSetup
                 request.provider_name = CustomProvider.Text.Trim();
             }
             request.telegram_bot_token = telegramVisible && TelegramToken.TextLength > 0 ? TelegramToken.Text : null;
+            var entries = new System.Collections.Generic.List<FallbackEntry>();
+            foreach (var b in backups)
+                if (b != null && b.Preset != null && !String.IsNullOrEmpty(b.Key))
+                    entries.Add(new FallbackEntry { provider_id = b.Preset.id, endpoint = b.Preset.endpoint, model = b.Preset.model ?? "", api_key = b.Key });
+            request.fallbacks = entries.Count > 0 ? entries : null;
             return request;
         }
 
@@ -522,6 +601,8 @@ namespace HermesSetup
         {
             if (page < 0 || page > PageDone) return;
             PageIndex = page;
+            // A custom primary address may have changed on screen 1.
+            if (page == PageKey) RefreshBackupLink();
             for (int i = 0; i < pages.Length; i++) pages[i].Visible = (i == page);
             stepLabel.Text = "Экран " + (page + 1) + " из 4";
             UpdateWraps();
@@ -544,6 +625,8 @@ namespace HermesSetup
             {
                 var label = c as Label;
                 if (label != null && Object.Equals(label.Tag, "wrap")) label.MaximumSize = new Size(width, 0);
+                // A wrapping link line needs the same bound or it grows sideways instead.
+                if (c is FlowLayoutPanel && Object.Equals(c.Tag, "wrap")) c.MaximumSize = new Size(width, 0);
                 ApplyWrap(c, width);
             }
         }
@@ -622,7 +705,7 @@ namespace HermesSetup
             }
             finally
             {
-                request.api_key = null; request.telegram_bot_token = null; running = false; timer.Stop(); silence.Visible = false;
+                request.ClearSecrets(); running = false; timer.Stop(); silence.Visible = false;
                 // Success already moved to PageDone while running was true; refresh
                 // on any page so «Открыть Hermes» becomes active.
                 if (PageIndex == PageInstall) statusHint.Visible = !action.Visible;

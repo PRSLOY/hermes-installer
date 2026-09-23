@@ -70,20 +70,30 @@ def request(base, key, path, payload=None):
 # instead of the expected 401/AUTH. Transport failures (status 0) are retried; a
 # definitive provider verdict (any real HTTP status) is never retried.
 TRANSPORT_ATTEMPTS = 3
+# Live 2026-09-23: GWarden's nginx answered 502 for a few seconds at a time; the
+# owner's GUI install failed its key check with NETWORK after ~20 s and passed on a
+# manual retry. A gateway 502/503/504 means the upstream never produced an answer,
+# so retrying it spends no quota. Pauses give the gateway time to come back.
+RETRY_STATUSES = (0, 502, 503, 504)
+RETRY_PAUSES = (3, 8)
 
 
-def request_with_retry(base, key, path, payload=None, transport=request):
-    """Request, retrying only transport failures (status 0).
+def request_with_retry(base, key, path, payload=None, transport=request, sleep=None):
+    """Request, retrying only 'no answer' outcomes: transport failure (status 0)
+    and gateway 502/503/504, with short pauses in between.
 
-    Only status 0 -- the local 'no response' signal -- is retried. Every real
-    provider answer, including 401/402/429/5xx, is returned on the first attempt so
-    the caller's verdict stays exact and no quota is spent twice.
+    Every definitive provider answer -- 401/402/429, 500, any other status -- is
+    returned on the first attempt so the caller's verdict stays exact and no quota
+    is spent twice.
     """
+    import time
+    sleep = sleep or time.sleep
     status, body = (0, None)
     for attempt in range(TRANSPORT_ATTEMPTS):
         status, body = transport(base, key, path, payload)
-        if status != 0 or attempt == TRANSPORT_ATTEMPTS - 1:
+        if status not in RETRY_STATUSES or attempt == TRANSPORT_ATTEMPTS - 1:
             return status, body
+        sleep(RETRY_PAUSES[min(attempt, len(RETRY_PAUSES) - 1)])
     return status, body
 
 def check_status(status):

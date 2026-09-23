@@ -21,6 +21,11 @@ from backend import provider
 class ApiRetryTests(unittest.TestCase):
     def setUp(self):
         self.calls = []
+        self._pauses = provider.RETRY_PAUSES
+        provider.RETRY_PAUSES = (0, 0)   # no real sleeping in tests
+
+    def tearDown(self):
+        provider.RETRY_PAUSES = self._pauses
 
     def transport(self, statuses, body=None):
         """Return a transport that yields the given statuses in order."""
@@ -68,6 +73,31 @@ class ApiRetryTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 'QUOTA')
         self.assertEqual(len(self.calls), 1)
 
+    def test_gateway_502_then_success_is_accepted(self):
+        """Live 2026-09-23: GWarden 502 for a few seconds must not fail the key check."""
+        transport = self.transport([502, 200], body=self.ok_body())
+        self.assertEqual(provider.probe_model('https://example.invalid/v1', 'k', 'm', transport=transport), 'm')
+        self.assertEqual(len(self.calls), 2)
+
+    def test_persistent_gateway_errors_end_in_network_after_bounded_retries(self):
+        for status in (502, 503, 504):
+            self.calls = []
+            with self.assertRaises(provider.Failure) as ctx:
+                provider.probe_model('https://example.invalid/v1', 'k', 'm', transport=self.transport([status]))
+            self.assertEqual(ctx.exception.code, 'NETWORK')
+            self.assertEqual(len(self.calls), provider.TRANSPORT_ATTEMPTS)
+
+    def test_internal_500_is_a_verdict_not_retried(self):
+        with self.assertRaises(provider.Failure):
+            provider.probe_model('https://example.invalid/v1', 'k', 'm', transport=self.transport([500]))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_pauses_between_attempts(self):
+        slept = []
+        provider.RETRY_PAUSES = (3, 8)
+        status, _ = provider.request_with_retry('https://example.invalid/v1', 'k', '/models',
+                                                transport=self.transport([0, 502, 200]), sleep=slept.append)
+        self.assertEqual((status, slept), (200, [3, 8]))
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

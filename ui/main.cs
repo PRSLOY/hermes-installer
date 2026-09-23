@@ -93,6 +93,8 @@ namespace HermesSetup
         // Explicit dependency injection for offline tests; the GUI always uses the production policy.
         public Protocol(string secret, Action<string> progress, Func<string,string[],bool> launchValidator)
         { this.secret = secret; this.progress = progress; this.launchValidator = launchValidator; }
+        // Other keys of the same request (Telegram token, backup keys): redacted the same way.
+        public string[] ExtraSecrets;
         public void Invalidate() { invalid = true; }
         public string SafeText(string text)
         {
@@ -101,6 +103,13 @@ namespace HermesSetup
                 text = text.Replace(secret, "[ключ скрыт]");
                 text = text.Replace(Uri.EscapeDataString(secret), "[ключ скрыт]");
             }
+            if (ExtraSecrets != null)
+                foreach (string extra in ExtraSecrets)
+                    if (!String.IsNullOrEmpty(extra))
+                    {
+                        text = text.Replace(extra, "[ключ скрыт]");
+                        text = text.Replace(Uri.EscapeDataString(extra), "[ключ скрыт]");
+                    }
             var safe = new StringBuilder();
             foreach (char c in text) if (!Char.IsControl(c) || c == '\n' || c == '\r') safe.Append(c);
             return safe.ToString();

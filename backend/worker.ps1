@@ -217,19 +217,53 @@ function Invoke-TelegramAction([string]$Action, $InputData, [string]$HomeDir, [s
         'pending'          = 'Боту написали. Выберите себя, чтобы бот отвечал только вам.'
         'none'             = 'Пока сообщений нет — напишите боту и нажмите «Проверить» ещё раз.'
         'done'             = 'Телеграм уже подключён к вам. Пишите боту — он ответит.'
-        'approved'         = 'Готово! Бот прислал вам приветствие в Телеграм — пишите ему, что нужно сделать.'
+        'approved'         = 'Готово! Бот прислал вам приветствие в Телеграм — пишите ему, что нужно сделать. Если в Hermes в «Сообщениях» на пару секунд видно «disconnected» — это бот перезапускается, подождите.'
         'approved_partial' = 'Доступ выдан — пишите боту, он ответит. Перезапуск бота не завершился; если бот попросит «/sethome», перезагрузите компьютер.'
         'expired'          = 'Этот запрос устарел. Напишите боту ещё раз и нажмите «Проверить».'
         'off'              = 'Телеграм-бот на этом компьютере не настроен.'
         'failed'           = 'Не удалось проверить Телеграм. Hermes работает; повторите через минуту.'
     }
     $message = $text[$status]
-    if ($status -eq 'approved' -and $reply.welcomed -ne $true) { $message = 'Готово! Напишите боту в Телеграм — теперь он ответит.' }
+    if ($status -eq 'approved' -and $reply.welcomed -ne $true) { $message = 'Готово! Напишите боту в Телеграм — теперь он ответит. Если в Hermes в «Сообщениях» на пару секунд видно «disconnected» — это бот перезапускается, подождите.' }
     Send-Event @{type='telegram'; status=$status; message=$message; requests=[object[]]$requests}
     return 0
 }
+# --- Optional backup providers (issue #10) -----------------------------------
+# 0-2 entries {provider_id, endpoint, model, api_key}, validated like the primary.
+# Returned as hashtables for fallbacks.py only; configure.py never sees them.
+# Throws on any malformed entry: the caller maps that to the INPUT error.
+function Get-FallbackEntries($InputData) {
+    $value = $InputData.fallbacks
+    if ($null -eq $value) { return }
+    if ($value -isnot [array] -or $value.Count -gt 2) { throw 'fallbacks' }
+    $seenIds = @()
+    $seenEndpoints = @(([string]$InputData.endpoint).TrimEnd('/').ToLowerInvariant())
+    foreach ($fb in $value) {
+        if ($fb -isnot [System.Management.Automation.PSCustomObject]) { throw 'fallbacks' }
+        foreach ($name in @($fb.PSObject.Properties.Name)) { if ($name -cnotin @('provider_id','endpoint','model','api_key')) { throw 'fallbacks' } }
+        if ($fb.provider_id -isnot [string] -or $fb.provider_id -cnotmatch '^[A-Za-z0-9_.-]{1,64}$') { throw 'fallbacks' }
+        if ($fb.endpoint -isnot [string] -or $fb.api_key -isnot [string]) { throw 'fallbacks' }
+        $uri = [Uri]$fb.endpoint
+        if (-not $uri.IsAbsoluteUri -or $uri.Scheme -cne 'https' -or -not $uri.Host -or $uri.UserInfo -or $uri.Query -or $uri.Fragment) { throw 'fallbacks' }
+        if ($fb.api_key -cnotmatch '^[\x21-\x7E]{8,8192}$') { throw 'fallbacks' }
+        $model = $fb.model
+        if ($null -ne $model -and ($model -isnot [string] -or $model.Length -gt 256 -or $model -match '[\x00-\x1F]')) { throw 'fallbacks' }
+        # Never the primary again, never the same provider twice.
+        $endpointKey = $fb.endpoint.TrimEnd('/').ToLowerInvariant()
+        if ($endpointKey -cin $seenEndpoints -or $fb.provider_id -cin $seenIds) { throw 'fallbacks' }
+        $seenEndpoints += $endpointKey; $seenIds += $fb.provider_id
+        @{provider_id=$fb.provider_id; endpoint=$fb.endpoint; model=[string]$model; api_key=$fb.api_key}
+    }
+}
+$script:FallbackText = @{
+    'auth'    = 'ключ отклонён'
+    'quota'   = 'на ключе нет средств или исчерпан лимит'
+    'network' = 'API провайдера не отвечает'
+    'verify'  = 'API провайдера ответил некорректно'
+    'failed'  = 'не удалось сохранить настройку'
+}
 function Main {
-    $mutex = $null; $locked = $false
+    $mutex = $null; $locked = $false; $fallbackEntries = @()
     try {
         try {
             # .NET Framework may prepend a UTF-8 BOM to redirected stdin when the
@@ -246,7 +280,7 @@ function Main {
                 foreach ($name in @($inputData.PSObject.Properties.Name)) { if ($name -cnotin $allowedFields) { throw 'field' } }
                 if ($telegramAction -ceq 'telegram_approve' -and ($inputData.request_id -isnot [string] -or $inputData.request_id -cnotmatch '^[0-9a-f]{16}$' -or $inputData.user_id -isnot [string] -or $inputData.user_id -cnotmatch '^[0-9]{1,20}$')) { throw 'request' }
             }
-        } catch { Fail 'INPUT' 'Проверьте данные: точный HTTPS-адрес API, API-ключ, необязательное имя модели и токен Телеграм-бота.' }
+        } catch { Fail 'INPUT' 'Проверьте данные: точный HTTPS-адрес API, API-ключ, необязательное имя модели, токен Телеграм-бота и запасные ключи.' }
         try {
           if (-not $telegramAction) {
             if ($inputData.protocol -ne 1 -or $inputData.action -cne 'install') { throw 'protocol' }
@@ -261,12 +295,15 @@ function Main {
             # Optional Telegram bot token: absent/empty = skipped; otherwise digits:secret.
             $tgValue = $inputData.telegram_bot_token
             if ($null -ne $tgValue -and ($tgValue -isnot [string] -or ($tgValue.Length -gt 0 -and $tgValue -cnotmatch '^[0-9]{1,20}:[A-Za-z0-9_-]{30,64}$'))) { throw 'telegram' }
+            $fallbackEntries = @(Get-FallbackEntries $inputData)
           }
-        } catch { Fail 'INPUT' 'Проверьте данные: точный HTTPS-адрес API, API-ключ, необязательное имя модели и токен Телеграм-бота.' }
+        } catch { Fail 'INPUT' 'Проверьте данные: точный HTTPS-адрес API, API-ключ, необязательное имя модели, токен Телеграм-бота и запасные ключи.' }
         # The bot token goes only to telegram.py; configure.py never sees it.
         $telegramToken = [string]$inputData.telegram_bot_token
         $tgValue = $null
         $inputData.PSObject.Properties.Remove('telegram_bot_token')
+        # Backup keys go only to fallbacks.py (after the primary is verified); never to configure.py.
+        $inputData.PSObject.Properties.Remove('fallbacks')
         $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         $mutex = New-Object Threading.Mutex($false, "Local\HermesSubscriberSetup-$sid")
         try { $locked = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $locked = $true }
@@ -387,6 +424,37 @@ function Main {
         }
         if (-not $mpText.ContainsKey($mpStatus)) { $mpStatus = 'failed' }
         Send-Event @{type='progress';message=$mpText[$mpStatus]}
+        # Optional backup providers (issue #10): Hermes' own fallback_providers chain.
+        # Only after the primary is verified and the set ran; never terminal. Keys
+        # travel on stdin to fallbacks.py only and are dropped right after; its
+        # statuses map to fixed Russian lines, no provider text is relayed.
+        $fallbackNote = ''
+        if ($fallbackEntries.Count -gt 0) {
+            Send-Event @{type='progress';message='Подключаю запасных провайдеров…'}
+            $fbTotal = $fallbackEntries.Count
+            $fbStatuses = @('failed') * $fbTotal
+            $fbInput = $null
+            try {
+                $script:ChildLabel = 'Запасные провайдеры'
+                $fbInput = @{fallbacks=[object[]]$fallbackEntries} | ConvertTo-Json -Compress -Depth 6
+                # Up to 2 live checks of 3 x 45 s transport attempts each, plus the writes.
+                $fb = Run-Child $python @((Join-Path $PSScriptRoot 'fallbacks.py'),$homeDir) $fbInput 420
+                $fbLast = @($fb.Text -split "`n" | Where-Object { $_.Trim() })[-1]
+                $fbResults = @(($fbLast | ConvertFrom-Json).results)
+                for ($i = 0; $i -lt $fbTotal -and $i -lt $fbResults.Count; $i++) {
+                    $s = [string]$fbResults[$i].status
+                    if ($s -cin @('added','exists') -or $script:FallbackText.ContainsKey($s)) { $fbStatuses[$i] = $s }
+                }
+            } catch { }
+            $fbInput = $null; $fallbackEntries = @()
+            $fbDone = 0
+            for ($i = 0; $i -lt $fbTotal; $i++) {
+                if ($fbStatuses[$i] -cin @('added','exists')) { $fbDone++ }
+                else { Send-Event @{type='progress';message=('Запасной провайдер ' + ($i + 1) + ' не подключён: ' + $script:FallbackText[$fbStatuses[$i]] + '.')} }
+            }
+            $fallbackNote = "Запасные провайдеры: подключено $fbDone из $fbTotal."
+            Send-Event @{type='progress';message=$fallbackNote}
+        }
         # Optional Telegram bot. Same contract as the set: never terminal, one fixed
         # Russian line on failure, child output parsed (last line) and never relayed.
         # Voice input (local faster-whisper) needs the VC++ runtime: Telegram voice notes
@@ -440,7 +508,8 @@ function Main {
                 }
             }
         }
-        $successEvent = @{type='success';message=('Hermes ответил через ваш API; настройки сохранены, файлы Desktop проверены.' + $telegramNote);launch_path=$desktopExe;launch_args=@()}
+        if ($fallbackNote) { $fallbackNote = ' ' + $fallbackNote }
+        $successEvent = @{type='success';message=('Hermes ответил через ваш API; настройки сохранены, файлы Desktop проверены.' + $fallbackNote + $telegramNote);launch_path=$desktopExe;launch_args=@()}
         if ($telegramBot) { $successEvent['telegram_bot'] = $telegramBot }
         Send-Event $successEvent
         return 0
@@ -451,7 +520,7 @@ function Main {
         return 1
     } finally {
         $script:InstallState=$null
-        $raw = $null; $inputData = $null; $telegramToken = $null
+        $raw = $null; $inputData = $null; $telegramToken = $null; $fallbackEntries = $null; $fbInput = $null
         if ($locked) { $mutex.ReleaseMutex() }
         if ($mutex) { $mutex.Dispose() }
     }
