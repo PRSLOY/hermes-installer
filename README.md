@@ -78,7 +78,9 @@ powershell -ExecutionPolicy Bypass -File .\package-dist.ps1   # собирает
 Тесты:
 
 ```powershell
-python -m pytest tests\backend -q      # нужен Python 3.12 с pytest и pyyaml
+python -m pip install pytest pyyaml httpx certifi
+python -m pytest tests\backend -q      # нужен Python 3.12
+python -m pytest tests\test_clean_package.py -q   # сборка пакета с нуля
 powershell -File tests\ui\run.ps1      # тесты интерфейса; запускать в Windows Sandbox
 ```
 
