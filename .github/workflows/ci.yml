@@ -8,6 +8,11 @@ on:
 jobs:
   tests:
     runs-on: windows-latest
+    defaults:
+      run:
+        # Windows PowerShell 5.1, like the product: under the runner's default pwsh 7,
+        # child powershell.exe inherits pwsh module paths and cannot even load Get-FileHash.
+        shell: powershell
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
