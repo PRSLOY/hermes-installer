@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <assemblyIdentity version="1.0.0.0" name="HermesSetup.app"/>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
+    <security>
+      <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <!-- System-DPI aware: without this the process is DPI-unaware and Windows
+       bitmap-stretches the window on 125-150% displays (issue #16). The wizard
+       already declares AutoScaleMode.Dpi against a 96-DPI baseline, so WinForms
+       scales the layout once at startup from the system DPI -- exactly what that
+       code expects. PerMonitorV2 is deliberately not used: it needs app.config
+       plus dynamic WM_DPICHANGED handling the wizard does not have. -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
+    </windowsSettings>
+  </application>
+</assembly>

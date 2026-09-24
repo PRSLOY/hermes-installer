@@ -4,6 +4,6 @@ if (-not (Test-Path -LiteralPath $csc)) { throw '.NET Framework 4 compiler missi
 $out = Join-Path $PSScriptRoot 'dist\HermesSetup.exe'
 [void][IO.Directory]::CreateDirectory((Split-Path $out -Parent))
 $sources = @(Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'ui') -Filter '*.cs' | ForEach-Object FullName)
-& $csc /nologo /target:winexe /platform:x64 /optimize+ /utf8output /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll "/out:$out" $sources
+& $csc /nologo /target:winexe /platform:x64 /optimize+ /utf8output /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll "/win32manifest:$PSScriptRoot\ui\app.manifest" "/out:$out" $sources
 if ($LASTEXITCODE -ne 0) { throw 'C# compilation failed.' }
 Get-FileHash -LiteralPath $out -Algorithm SHA256 | Format-List
