@@ -139,9 +139,33 @@ namespace HermesSetup
                 // greenlet-based marketplaces then fail to load (sandbox 2026-09-23).
                 "SystemDrive", "ProgramW6432", "CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432", "USERNAME", "USERDOMAIN", "COMPUTERNAME", "HOMEDRIVE", "HOMEPATH", "PUBLIC" })
             { string value=Environment.GetEnvironmentVariable(name); if(value!=null) inherited[name]=value; }
+            // The release-pinned artifact hashes travel with the EXE (issue #15): the
+            // embedded manifest is handed to the worker as base64, so verification never
+            // depends on a file that could be swapped separately from the EXE.
+            string manifest = ManifestBase64();
+            if (manifest != null) inherited["HERMES_ARTIFACTS_MANIFEST_B64"] = manifest;
             psi.EnvironmentVariables.Clear();
             foreach(var entry in inherited) psi.EnvironmentVariables[entry.Key]=entry.Value;
             return psi;
+        }
+        // Embedded resource "HermesSetup.artifacts.sha256.json" (added by build-ui.ps1),
+        // base64 so it survives as a single environment value. Null when the resource is
+        // absent (a build without the manifest); the worker then falls back to install.sha256.
+        static string ManifestBase64()
+        {
+            try
+            {
+                using (Stream stream = typeof(WorkerClient).Assembly.GetManifestResourceStream("HermesSetup.artifacts.sha256.json"))
+                {
+                    if (stream == null) return null;
+                    using (var buffer = new MemoryStream())
+                    {
+                        stream.CopyTo(buffer);
+                        return Convert.ToBase64String(buffer.ToArray());
+                    }
+                }
+            }
+            catch { return null; }
         }
         public static async Task<Outcome> RunAsync(string worker, Request request, Action<string> progress)
         { return await RunAsync(worker, request, progress, LaunchPolicy.Validate, null); }

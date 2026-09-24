@@ -48,11 +48,15 @@ class DownloadRetryTests(unittest.TestCase):
                       'after the retries are exhausted the stage must fail loudly, not continue '
                       'with a truncated archive')
 
-    def test_node_download_is_retried(self):
-        i = self.src.index('$indexUrl = "https://nodejs.org/dist/latest-v')
-        block = self.src[i:i + 1400]
-        self.assertIn('Invoke-DownloadWithRetry', block,
-                      'the Node.js index and zip must also retry -- same single-shot pattern')
+    def test_node_download_is_retried_and_pinned(self):
+        # issue #15: Node.js is now pinned to an exact build from the release manifest
+        # instead of scraping the "latest" index, so it must be hash-checked too.
+        i = self.src.index("Get-ArtifactEntry 'node'")
+        block = self.src[i:i + 1600]
+        self.assertIn('Invoke-DownloadFromSources', block,
+                      'the pinned Node.js zip must still retry across sources')
+        self.assertIn("Assert-ArtifactHash -Id 'node'", block,
+                      'the pinned Node.js zip must be verified against the manifest')
 
     def test_repo_archive_download_is_retried(self):
         i = self.src.index('$zipPath = "$env:TEMP\\hermes-agent-$zipLabel.zip"')

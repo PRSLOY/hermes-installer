@@ -1,0 +1,72 @@
+{
+    "schema":  1,
+    "artifacts":  [
+                      {
+                          "id":  "portablegit",
+                          "arch":  "x64",
+                          "version":  "2.54.0",
+                          "sha256":  "bea006a6cc69673f27b1647e84ab3a68e912fbc175ab6320c5987e012897f311",
+                          "sources":  [
+                                          "https://github.com/git-for-windows/git/releases/download/v2.54.0.windows.1/PortableGit-2.54.0-64-bit.7z.exe",
+                                          "https://registry.npmmirror.com/-/binary/git-for-windows/v2.54.0.windows.1/PortableGit-2.54.0-64-bit.7z.exe",
+                                          "https://mirrors.huaweicloud.com/git-for-windows/v2.54.0.windows.1/PortableGit-2.54.0-64-bit.7z.exe"
+                                      ]
+                      },
+                      {
+                          "id":  "portablegit",
+                          "arch":  "arm64",
+                          "version":  "2.54.0",
+                          "sha256":  "f8e92cd3359fcbb96998cfd606a536ccc6dbfb23c04e12b29042f9ba45b6b0c7",
+                          "sources":  [
+                                          "https://github.com/git-for-windows/git/releases/download/v2.54.0.windows.1/PortableGit-2.54.0-arm64.7z.exe",
+                                          "https://registry.npmmirror.com/-/binary/git-for-windows/v2.54.0.windows.1/PortableGit-2.54.0-arm64.7z.exe",
+                                          "https://mirrors.huaweicloud.com/git-for-windows/v2.54.0.windows.1/PortableGit-2.54.0-arm64.7z.exe"
+                                      ]
+                      },
+                      {
+                          "id":  "portablegit",
+                          "arch":  "x86",
+                          "version":  "2.54.0",
+                          "sha256":  "52fc36c9b22611f0a6a7fabdc68c763b914400e3af0e35ad822468dc64cb7981",
+                          "sources":  [
+                                          "https://github.com/git-for-windows/git/releases/download/v2.54.0.windows.1/MinGit-2.54.0-32-bit.zip",
+                                          "https://registry.npmmirror.com/-/binary/git-for-windows/v2.54.0.windows.1/MinGit-2.54.0-32-bit.zip",
+                                          "https://mirrors.huaweicloud.com/git-for-windows/v2.54.0.windows.1/MinGit-2.54.0-32-bit.zip"
+                                      ]
+                      },
+                      {
+                          "id":  "node",
+                          "arch":  "x64",
+                          "version":  "v22.23.3",
+                          "sha256":  "2b0ff57b049cda1bbcea2240eec20467018713c1efe1f7360c2681859b90ed71",
+                          "sources":  [
+                                          "https://nodejs.org/dist/v22.23.3/node-v22.23.3-win-x64.zip",
+                                          "https://registry.npmmirror.com/-/binary/node/v22.23.3/node-v22.23.3-win-x64.zip"
+                                      ]
+                      },
+                      {
+                          "id":  "node",
+                          "arch":  "arm64",
+                          "version":  "v22.23.3",
+                          "sha256":  "33dad22e4cef5ee8f9fbb1b0d037fdacd0e56d12a4580f0d63f68b894deab535",
+                          "sources":  [
+                                          "https://nodejs.org/dist/v22.23.3/node-v22.23.3-win-arm64.zip",
+                                          "https://registry.npmmirror.com/-/binary/node/v22.23.3/node-v22.23.3-win-arm64.zip"
+                                      ]
+                      },
+                      {
+                          "id":  "hermes-source",
+                          "commit":  "c712f06dcdd24053a4118f38d2090ac53137ecfc",
+                          "content_sha256":  "f2dac2547472982e7b36cc7aec47cff4bb1168307b179dcfd6545c72dd714e30",
+                          "sources":  [
+                                          "https://github.com/NousResearch/hermes-agent/archive/c712f06dcdd24053a4118f38d2090ac53137ecfc.zip",
+                                          "https://ghproxy.net/https://github.com/NousResearch/hermes-agent/archive/c712f06dcdd24053a4118f38d2090ac53137ecfc.zip",
+                                          "https://gh-proxy.com/https://github.com/NousResearch/hermes-agent/archive/c712f06dcdd24053a4118f38d2090ac53137ecfc.zip"
+                                      ]
+                      },
+                      {
+                          "id":  "install-ps1",
+                          "sha256":  "8f58df4ef5492fc28e6203d3a63ef10467d6383aa02918450f053377f3d2dd71"
+                      }
+                  ]
+}

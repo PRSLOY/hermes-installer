@@ -129,6 +129,97 @@ function Invoke-DownloadFromSources {
     return $false
 }
 
+# Subscriber patch: release-pinned artifact hashes (issue #15). The manifest is
+# embedded in HermesSetup.exe and handed down via $env:HERMES_ARTIFACTS_MANIFEST_B64;
+# nothing is fetched over the network for verification. A downloaded artifact is
+# accepted only when its hash matches the pinned entry -- there is no size-based
+# fallback, and a missing entry is a hard stop, not a silent skip.
+$script:ArtifactManifest = $null
+function Get-ArtifactManifest {
+    if ($null -ne $script:ArtifactManifest) { return $script:ArtifactManifest }
+    $script:ArtifactManifest = @{}
+    $b64 = $env:HERMES_ARTIFACTS_MANIFEST_B64
+    if ([string]::IsNullOrWhiteSpace($b64)) { return $script:ArtifactManifest }
+    try {
+        $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
+        $doc = $json | ConvertFrom-Json
+    } catch { return $script:ArtifactManifest }
+    foreach ($a in @($doc.artifacts)) {
+        if ($null -eq $a.id) { continue }
+        $key = if ($a.arch) { "$($a.id):$($a.arch)" } else { [string]$a.id }
+        $script:ArtifactManifest[$key] = $a
+    }
+    return $script:ArtifactManifest
+}
+function Get-ArtifactEntry([string]$Id, [string]$Arch) {
+    $m = Get-ArtifactManifest
+    $key = if ($Arch) { "${Id}:${Arch}" } else { $Id }
+    if ($m.ContainsKey($key)) { return $m[$key] }
+    return $null
+}
+# Fatal on a missing entry or a hash mismatch: no "the size looked right" path.
+function Assert-ArtifactHash([string]$Id, [string]$Arch, [string]$Path, [string]$Label) {
+    $entry = Get-ArtifactEntry $Id $Arch
+    if ($null -eq $entry) { throw "No pinned hash for '$Id' ($Arch) in the release manifest; refusing to use $Label." }
+    $expected = ([string]$entry.sha256).Trim().ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($expected)) { throw "Empty pinned hash for '$Id' ($Arch); refusing to use $Label." }
+    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $expected) {
+        throw "$Label failed the integrity check: SHA-256 $actual does not match the pinned $expected. The download was tampered with or corrupted; the step is aborted."
+    }
+    return $true
+}
+# Deterministic content hash of a source archive (issue #15): sorted normalized
+# entry names (root directory stripped, forward slashes), per entry
+# "<rel>`0<hex sha256 of decompressed bytes>", joined with "`n", then SHA-256.
+# Hashing the decompressed contents -- not the zip bytes -- keeps it valid when
+# GitHub regenerates the archive for the same commit, and lets us verify BEFORE
+# anything is written to disk.
+function Get-ArchiveContentSha256([string]$ZipPath) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    $zip = [IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        $items = @()
+        foreach ($e in $zip.Entries) {
+            $name = $e.FullName.Replace('\', '/')
+            if ($name.EndsWith('/')) { continue }
+            $slash = $name.IndexOf('/')
+            if ($slash -lt 0) { continue }
+            $rel = $name.Substring($slash + 1)
+            if ($rel -eq '') { continue }
+            $items += [pscustomobject]@{ Rel = $rel; Entry = $e }
+        }
+        $rels = @($items | ForEach-Object { $_.Rel })
+        [Array]::Sort($rels, [System.StringComparer]::Ordinal)
+        $byRel = @{}
+        foreach ($it in $items) { $byRel[$it.Rel] = $it.Entry }
+        $sha = [Security.Cryptography.SHA256]::Create()
+        $sb = New-Object System.Text.StringBuilder
+        try {
+            foreach ($rel in $rels) {
+                $stream = $byRel[$rel].Open()
+                try { $hex = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
+                finally { $stream.Dispose() }
+                [void]$sb.Append($rel).Append([char]0).Append($hex).Append("`n")
+            }
+        } finally { $sha.Dispose() }
+        $sha2 = [Security.Cryptography.SHA256]::Create()
+        try { return [BitConverter]::ToString($sha2.ComputeHash([Text.Encoding]::UTF8.GetBytes($sb.ToString()))).Replace('-', '').ToLowerInvariant() }
+        finally { $sha2.Dispose() }
+    } finally { $zip.Dispose() }
+}
+function Assert-ArchiveContentHash([string]$Path, [string]$Label) {
+    $entry = Get-ArtifactEntry 'hermes-source' $null
+    if ($null -eq $entry) { throw "No pinned source hash in the release manifest; refusing to install." }
+    $expected = ([string]$entry.content_sha256).Trim().ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($expected)) { throw "Empty pinned source hash; refusing to install." }
+    $actual = Get-ArchiveContentSha256 $Path
+    if ($actual -ne $expected) {
+        throw "$Label failed the integrity check: content hash $actual does not match the pinned $expected. The archive was tampered with or is the wrong revision; the step is aborted."
+    }
+    return $true
+}
+
 # Suppress Invoke-WebRequest's per-chunk progress bar.  Windows PowerShell
 # 5.1's progress UI repaints synchronously on every received byte, which
 # pegs CPU on a single core and throttles downloads by 10-100x (a 57MB
@@ -1628,6 +1719,9 @@ function Install-Git {
         if (-not (Invoke-DownloadFromSources -Sources $gitSources -OutFile $tmpFile -Label $assetName -MinBytes 3000000)) {
             throw "PortableGit download failed after retries: $assetName"
         }
+        # Subscriber patch: verify the pinned hash before extracting (issue #15).
+        $gitArchKey = if ($arch -eq 'arm64') { 'arm64' } elseif ($arch -eq '32-bit-mingit') { 'x86' } else { 'x64' }
+        Assert-ArtifactHash -Id 'portablegit' -Arch $gitArchKey -Path $tmpFile -Label $assetName
 
         if (Test-Path $gitDir) {
             Write-Info "Removing previous Git install at $gitDir ..."
@@ -1864,22 +1958,22 @@ function Test-Node {
     Write-Info "(no admin rights required; isolated from any system Node install)"
     try {
         $arch = Get-WindowsArch
-        $indexUrl = "https://nodejs.org/dist/latest-v${NodeVersion}.x/"
-        $indexPage = $null
-        if (-not (Invoke-DownloadWithRetry -Uri $indexUrl -OutFile "$env:TEMP\node-index.html" -Label 'node index')) {
-            throw "Node.js index download failed after retries: $indexUrl"
-        }
-        $indexPage = [pscustomobject]@{ Content = (Get-Content "$env:TEMP\node-index.html" -Raw) }
-        $zipName = ($indexPage.Content | Select-String -Pattern "node-v${NodeVersion}\.\d+\.\d+-win-${arch}\.zip" -AllMatches).Matches[0].Value
+        # Subscriber patch: pin the exact Node.js build from the release manifest
+        # (issue #15). The old path scraped the "latest-v${NodeVersion}.x" index and
+        # installed whatever patch it found, so no hash could be pinned.
+        $nodeArchKey = if ($arch -eq 'arm64') { 'arm64' } else { 'x64' }
+        $nodeEntry = Get-ArtifactEntry 'node' $nodeArchKey
+        if ($null -eq $nodeEntry) { throw "No pinned Node.js entry for '$nodeArchKey' in the release manifest." }
+        $zipName = Split-Path ([string](@($nodeEntry.sources)[0])) -Leaf
+        $tmpZip = "$env:TEMP\$zipName"
+        $tmpDir = "$env:TEMP\hermes-node-extract"
 
         if ($zipName) {
-            $downloadUrl = "${indexUrl}${zipName}"
-            $tmpZip = "$env:TEMP\$zipName"
-            $tmpDir = "$env:TEMP\hermes-node-extract"
-
-            if (-not (Invoke-DownloadWithRetry -Uri $downloadUrl -OutFile $tmpZip -Label $zipName)) {
+            if (-not (Invoke-DownloadFromSources -Sources @($nodeEntry.sources) -OutFile $tmpZip -Label $zipName -MinBytes 1000000)) {
                 throw "Node.js download failed after retries: $zipName"
             }
+            # Subscriber patch: verify the pinned hash before extracting (issue #15).
+            Assert-ArtifactHash -Id 'node' -Arch $nodeArchKey -Path $tmpZip -Label $zipName
             if (Test-Path $tmpDir) { Remove-Item -Recurse -Force $tmpDir }
             Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
 
@@ -2558,6 +2652,10 @@ function Install-Repository {
                 if (-not (Invoke-DownloadFromSources -Sources $zipSources -OutFile $zipPath -Label "hermes-agent $zipLabel" -MinBytes 1000000)) {
                     throw "Repository archive download failed after retries: $zipLabel"
                 }
+                # Subscriber patch: verify the pinned source content hash BEFORE anything
+                # is extracted (issue #15). Only the pinned commit has a hash; tag/branch
+                # runs are left unverified, as before.
+                if ($Commit) { Assert-ArchiveContentHash -Path $zipPath -Label "hermes-agent $zipLabel" }
                 if (Test-Path $extractPath) { Remove-Item -Recurse -Force $extractPath }
                 Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
 

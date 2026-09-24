@@ -334,7 +334,21 @@ function Main {
             if (Test-Path -LiteralPath $homeDir) { Fail 'CONFIG' 'Папка появилась извне. Установка остановлена.' }
             Send-Event @{type='progress';message='Устанавливаю официальный Hermes и Desktop. Это может занять 10–20 минут; возможен системный запрос разрешения.'}
             $installer = Join-Path $PSScriptRoot 'upstream\install.ps1'
-            $expected = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'upstream\install.sha256') -Raw).Trim()
+            # Subscriber patch: verify install.ps1 against the release manifest embedded
+            # in HermesSetup.exe (issue #15), not against the sibling install.sha256 --
+            # both files could be swapped together. The sibling file is only a fallback
+            # for a package built without the manifest.
+            $expected = $null
+            $manifestB64 = $env:HERMES_ARTIFACTS_MANIFEST_B64
+            if (-not [string]::IsNullOrWhiteSpace($manifestB64)) {
+                try {
+                    $doc = ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($manifestB64))) | ConvertFrom-Json
+                    $expected = [string](@($doc.artifacts | Where-Object { $_.id -eq 'install-ps1' })[0].sha256)
+                } catch { $expected = $null }
+            }
+            if ([string]::IsNullOrWhiteSpace($expected)) {
+                $expected = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'upstream\install.sha256') -Raw).Trim()
+            }
             if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash -ine $expected) { Fail 'INSTALL' 'Контрольная сумма официального установщика не совпала. Скачайте пакет заново.' }
             $script:InstallState=$state; $script:InstallInitialHash=Install-TreeHash $homeDir
             $result = Run-Child "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$installer,'-NonInteractive','-SkipSetup','-IncludeDesktop','-Json','-Commit',$pin,'-HermesHome',$homeDir,'-InstallDir',$repo) '' 2400 -StreamStages
