@@ -16,6 +16,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -271,6 +272,27 @@ MARKETPLACES_NAME = 'marketplaces'
 MARKETPLACES_REPO = 'Vladimir-Human/ru-marketplace-mcp'
 MARKETPLACES_COMMIT = 'c17bd360de60780a9e8d3690288b70181bd07355'
 MARKETPLACES_URL = 'https://codeload.github.com/%s/zip/%s' % (MARKETPLACES_REPO, MARKETPLACES_COMMIT)
+# github.com is blocked on many Russian links: the same archive through the GitHub proxies
+# install.ps1 uses ($script:GitHubZipProxies). A proxy can serve anything, so every source
+# is accepted only if the extracted tree matches the manifest built from the pinned commit
+# (assets/marketplaces/tree-manifest.sha256, tools/tree_manifest.py).
+MARKETPLACES_ZIP_SOURCES = (
+    MARKETPLACES_URL,
+    'https://ghproxy.net/https://github.com/%s/archive/%s.zip' % (MARKETPLACES_REPO, MARKETPLACES_COMMIT),
+    'https://gh-proxy.com/https://github.com/%s/archive/%s.zip' % (MARKETPLACES_REPO, MARKETPLACES_COMMIT),
+)
+MARKETPLACES_MANIFEST = 'tree-manifest.sha256'
+# ru-marketplace-mcp needs Python >= 3.12; Hermes brings only 3.11. uv downloads CPython from
+# github.com/astral-sh/python-build-standalone (after its own releases.astral.sh mirror), so a
+# blocked GitHub gets proxy retries. Safe: uv checks every managed-Python archive against the
+# SHA-256 in its embedded download metadata, whatever URL served it (uv-python downloads.rs).
+MARKETPLACES_PYTHON = '3.12'
+PYTHON_BUILDS_URL = 'https://github.com/astral-sh/python-build-standalone/releases/download'
+MARKETPLACES_PYTHON_MIRRORS = (None, 'https://ghproxy.net/' + PYTHON_BUILDS_URL, 'https://gh-proxy.com/' + PYTHON_BUILDS_URL)
+MARKETPLACES_PYTHON_ATTEMPT_TIMEOUT = 240
+# Inherited settings that would redirect the download or replace uv's hash source.
+UV_ENV_DROP = ('VIRTUAL_ENV', 'UV_PROJECT_ENVIRONMENT', 'PYTHONHOME', 'PYTHONPATH',
+               'UV_PYTHON_INSTALL_MIRROR', 'UV_PYTHON_DOWNLOADS_JSON_URL', 'UV_PYTHON_DOWNLOADS')
 MARKETPLACES_SOURCES = 'ozon,avito,yandex_market,detsky_mir,compare'
 MARKETPLACES_ENTRY = 'marketplace_connector.__main__:main'
 MARKETPLACES_LAUNCHER = ('direct_launcher.py', 'direct_common.py', 'direct_proxy.py', 'wb_browser_mcp.py')
@@ -280,7 +302,7 @@ WILDBERRIES_NAME = 'wildberries'
 WILDBERRIES_SCRIPT = 'wb_browser_mcp.py'
 MARKETPLACES_ZIP_LIMIT = 64 * 1024 * 1024
 MARKETPLACES_DOWNLOAD_TIMEOUT = 120
-# The worker gives this whole mode 900 s; sync gets the lion's share.
+# The worker gives this whole mode 900 s; Python download + sync share this budget.
 MARKETPLACES_SYNC_TIMEOUT = 660
 MARKETPLACES_PROBE_TIMEOUT = 120
 MARKER = '.hermes-installed'
@@ -359,6 +381,89 @@ def safe_extract(archive, dest):
     return dest / tops.pop()
 
 
+def read_tree_manifest(path, commit):
+    """{relative posix path: sha256} from a tools/tree_manifest.py manifest of `commit`."""
+    expected, manifest_commit, declared = {}, None, None
+    try:
+        lines = Path(path).read_text(encoding='utf-8').splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        if line.startswith('# commit '):
+            manifest_commit = line[len('# commit '):]
+        elif line.startswith('# files '):
+            declared = line[len('# files '):]
+        elif not line.startswith('#'):
+            digest, sep, rel = line.partition('  ')
+            if not sep or len(digest) != 64 or not rel or rel in expected:
+                raise Failure('EXTRAS', 'Список проверенных файлов поиска по маркетплейсам повреждён. Скачайте пакет заново.')
+            expected[rel] = digest
+    if manifest_commit != commit or declared != str(len(expected)) or not expected:
+        raise Failure('EXTRAS', 'Список проверенных файлов поиска по маркетплейсам повреждён. Скачайте пакет заново.')
+    return expected
+
+
+def verify_tree(root, expected):
+    """None when root holds exactly the expected files, byte for byte; otherwise a reason."""
+    import hashlib
+    root = Path(root)
+    matched = 0
+    for folder, _, names in os.walk(root):
+        for name in names:
+            path = Path(folder) / name
+            rel = path.relative_to(root).as_posix()
+            want = expected.get(rel)
+            if want is None:
+                return 'unexpected file ' + rel
+            if hashlib.sha256(path.read_bytes()).hexdigest() != want:
+                return 'content mismatch ' + rel
+            matched += 1
+    if matched != len(expected):
+        return '%d file(s) missing' % (len(expected) - matched)
+    return None
+
+
+def fetch_verified(fetch, work, expected):
+    """Try every source in order; return the extracted top folder of the first one whose
+    tree matches the manifest. A failed download or a wrong tree moves on to the next."""
+    tampered = False
+    for index, url in enumerate(MARKETPLACES_ZIP_SOURCES):
+        archive, out = work / 'repo.zip', work / ('x%d' % index)
+        try:
+            fetch(url, archive)
+            top = safe_extract(archive, out)
+        except Exception:
+            shutil.rmtree(out, ignore_errors=True)
+            continue
+        if verify_tree(top, expected) is None:
+            return top
+        tampered = True
+        shutil.rmtree(out, ignore_errors=True)
+    if tampered:
+        raise Failure('EXTRAS', 'Скачанный код поиска по маркетплейсам не совпал с проверенной версией. Установка остановлена.')
+    raise Failure('EXTRAS', 'Архив поиска по маркетплейсам не скачался.')
+
+
+def ensure_python(uv, cwd, env, runner, deadline):
+    """Install the managed CPython once: as is (releases.astral.sh, then github.com), then
+    through the GitHub proxies. uv verifies the archive hash on every route."""
+    for mirror in MARKETPLACES_PYTHON_MIRRORS:
+        remaining = deadline - time.monotonic()
+        if remaining < 30:
+            return False
+        attempt_env = dict(env)
+        if mirror:
+            attempt_env['UV_PYTHON_INSTALL_MIRROR'] = mirror
+        try:
+            code = runner([uv, 'python', 'install', '--no-config', MARKETPLACES_PYTHON], cwd,
+                          min(remaining, MARKETPLACES_PYTHON_ATTEMPT_TIMEOUT), attempt_env)
+        except subprocess.TimeoutExpired:
+            code = None
+        if code == 0:
+            return True
+    return False
+
+
 def run_quiet(cmd, cwd, timeout, env=None):
     """Run a helper without touching our stdout (it carries the JSON report)."""
     result = subprocess.run([str(c) for c in cmd], cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
@@ -367,12 +472,13 @@ def run_quiet(cmd, cwd, timeout, env=None):
     return result.returncode
 
 
-def install_marketplaces(home, assets, fetch=None, runner=None, uv=None):
+def install_marketplaces(home, assets, fetch=None, runner=None, uv=None, manifest=None):
     """Download the pinned repo, sync its venv, copy the launcher.
     Returns (venv_python, launcher_dir, state_dir). Raises on any failure.
     Idempotent: a complete install of the same commit is reused as is."""
     fetch = fetch or download_file
     runner = runner or run_quiet
+    manifest = manifest or Path(assets) / 'marketplaces' / MARKETPLACES_MANIFEST
     paths = marketplaces_paths(home)
     repo, launcher, state = paths['repo'], paths['launcher'], paths['state']
     python = repo / '.venv' / 'Scripts' / 'python.exe'
@@ -387,12 +493,14 @@ def install_marketplaces(home, assets, fetch=None, runner=None, uv=None):
         uv = uv or find_uv(home)
         if not uv:
             raise Failure('EXTRAS', 'Не найден uv для поиска по маркетплейсам.')
-        work = repo.parent / ('.download-' + uuid.uuid4().hex)
+        expected = read_tree_manifest(manifest, MARKETPLACES_COMMIT)
+        # Short work dir: HOME\mcp\.dl-XXXXXXXX\x0\ru-marketplace-mcp-<40 hex>\ plus the
+        # deepest repo path (79 chars) stays ~220 chars with a 32-char profile name. The old
+        # '.download-<32 hex>\x' form reached ~250, too close to MAX_PATH (260).
+        work = repo.parent / ('.dl-' + uuid.uuid4().hex[:8])
         work.mkdir(parents=True)
         try:
-            archive = work / 'repo.zip'
-            fetch(MARKETPLACES_URL, archive)
-            top = safe_extract(archive, work / 'x')
+            top = fetch_verified(fetch, work, expected)
             if not (top / 'uv.lock').is_file() or not (top / 'packages' / 'marketplace-connector').is_dir():
                 raise Failure('EXTRAS', 'Архив поиска по маркетплейсам неполный.')
             os.replace(top, repo)
@@ -400,10 +508,18 @@ def install_marketplaces(home, assets, fetch=None, runner=None, uv=None):
             shutil.rmtree(work, ignore_errors=True)
         # Marker first ('pending'): a later retry may remove this folder as ours.
         marker.write_text('pending', encoding='utf-8')
-        env = {k: v for k, v in os.environ.items() if k.upper() not in ('VIRTUAL_ENV', 'UV_PROJECT_ENVIRONMENT', 'PYTHONHOME', 'PYTHONPATH')}
+        env = {k: v for k, v in os.environ.items() if k.upper() not in UV_ENV_DROP}
         env['UV_PYTHON_PREFERENCE'] = 'managed'
-        code = runner([uv, 'sync', '--frozen', '--no-dev', '--package', 'marketplace-connector', '--python', '3.12'],
-                      repo, MARKETPLACES_SYNC_TIMEOUT, env)
+        deadline = time.monotonic() + MARKETPLACES_SYNC_TIMEOUT
+        ensure_python(uv, repo, env, runner, deadline)
+        # The interpreter step owns every download route; sync must not start a second,
+        # proxy-less download (it can still use a system 3.12 if the install failed).
+        sync_env = dict(env, UV_PYTHON_DOWNLOADS='never')
+        try:
+            code = runner([uv, 'sync', '--frozen', '--no-dev', '--package', 'marketplace-connector', '--python', MARKETPLACES_PYTHON],
+                          repo, max(30, deadline - time.monotonic()), sync_env)
+        except subprocess.TimeoutExpired:
+            code = None
         if code != 0 or not python.is_file():
             raise Failure('EXTRAS', 'Не удалось установить зависимости поиска по маркетплейсам.')
         marker.write_text(MARKETPLACES_COMMIT, encoding='utf-8')

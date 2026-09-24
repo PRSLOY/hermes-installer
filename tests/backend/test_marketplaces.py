@@ -3,6 +3,7 @@
 No network, no uv, no subprocess: the installer and the stdio probe are
 injected; the launcher's decision functions are pure.
 """
+import hashlib
 import importlib.util
 import io
 from pathlib import Path
@@ -467,43 +468,168 @@ def make_zip(entries):
     return buf.getvalue()
 
 
+REPO_FILES = {'uv.lock': 'lock', 'pyproject.toml': 'p', 'packages/marketplace-connector/pyproject.toml': 'p'}
+
+
+def repo_zip(files):
+    top = 'ru-marketplace-mcp-' + e.MARKETPLACES_COMMIT + '/'
+    return make_zip({top + rel: data for rel, data in files.items()})
+
+
+def write_manifest(path, files):
+    sys.path.insert(0, str(ROOT / 'tools'))
+    import tree_manifest
+    hashes = {rel: hashlib.sha256(data.encode()).hexdigest() for rel, data in files.items()}
+    Path(path).write_bytes(tree_manifest.render(e.MARKETPLACES_COMMIT, hashes))
+
+
 class InstallTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='mp-install-')
         self.home = Path(self.tmp.name) / 'home'
         self.home.mkdir()
         self.runs = []
+        self.fetched = []
+        self.served = {}  # url -> zip bytes; missing url = network error
+        for url in e.MARKETPLACES_ZIP_SOURCES:
+            self.served[url] = repo_zip(REPO_FILES)
+        self.manifest = Path(self.tmp.name) / 'tree-manifest.sha256'
+        write_manifest(self.manifest, REPO_FILES)
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def fetch(self, url, dest):
         self.assertIn(e.MARKETPLACES_COMMIT, url)
-        top = 'ru-marketplace-mcp-' + e.MARKETPLACES_COMMIT + '/'
-        Path(dest).write_bytes(make_zip({top + 'uv.lock': 'lock', top + 'pyproject.toml': 'p',
-                                         top + 'packages/marketplace-connector/pyproject.toml': 'p'}))
+        self.fetched.append(url)
+        if url not in self.served:
+            raise OSError('[WinError 10061] connection refused')
+        Path(dest).write_bytes(self.served[url])
 
     def runner(self, cmd, cwd, timeout, env):
-        self.runs.append(cmd)
-        py = Path(cwd) / '.venv' / 'Scripts' / 'python.exe'
-        py.parent.mkdir(parents=True, exist_ok=True)
-        py.write_bytes(b'')
+        self.runs.append((cmd, env))
+        if 'sync' in cmd:
+            py = Path(cwd) / '.venv' / 'Scripts' / 'python.exe'
+            py.parent.mkdir(parents=True, exist_ok=True)
+            py.write_bytes(b'')
         return 0
 
     def install(self, runner=None):
         return e.install_marketplaces(self.home, ROOT / 'assets', fetch=self.fetch, runner=runner or self.runner,
-                                      uv=Path('uv.exe'))
+                                      uv=Path('uv.exe'), manifest=self.manifest)
+
+    def syncs(self):
+        return [cmd for cmd, _ in self.runs if 'sync' in cmd]
 
     def test_install_then_reuse(self):
         python, launcher, state = self.install()
         self.assertTrue(python.is_file())
         self.assertEqual(sorted(p.name for p in launcher.glob('*.py')), sorted(e.MARKETPLACES_LAUNCHER))
         self.assertTrue(state.is_dir())
-        self.assertIn('--frozen', self.runs[0])
-        self.assertIn('--no-dev', self.runs[0])
+        self.assertIn('--frozen', self.syncs()[0])
+        self.assertIn('--no-dev', self.syncs()[0])
         self.assertEqual((python.parents[2] / e.MARKER).read_text(encoding='utf-8'), e.MARKETPLACES_COMMIT)
+        self.assertEqual(self.fetched, [e.MARKETPLACES_URL], 'a reachable codeload must be the only source used')
         self.install()
-        self.assertEqual(len(self.runs), 1, 'a complete install must not sync again')
+        self.assertEqual(len(self.syncs()), 1, 'a complete install must not sync again')
+
+    # --- sources + manifest -------------------------------------------------------------
+
+    def test_blocked_codeload_falls_back_to_the_proxies_in_order(self):
+        del self.served[e.MARKETPLACES_ZIP_SOURCES[0]]
+        del self.served[e.MARKETPLACES_ZIP_SOURCES[1]]
+        python, _, _ = self.install()
+        self.assertTrue(python.is_file())
+        self.assertEqual(self.fetched, list(e.MARKETPLACES_ZIP_SOURCES))
+        self.assertTrue(e.MARKETPLACES_ZIP_SOURCES[1].startswith('https://ghproxy.net/https://github.com/'))
+        self.assertTrue(e.MARKETPLACES_ZIP_SOURCES[2].startswith('https://gh-proxy.com/https://github.com/'))
+
+    def test_tampered_proxy_is_skipped_for_the_next_source(self):
+        del self.served[e.MARKETPLACES_ZIP_SOURCES[0]]
+        self.served[e.MARKETPLACES_ZIP_SOURCES[1]] = repo_zip(dict(REPO_FILES, **{'pyproject.toml': 'evil'}))
+        python, _, _ = self.install()
+        repo = python.parents[2]
+        self.assertEqual((repo / 'pyproject.toml').read_text(encoding='utf-8'), 'p')
+        self.assertEqual(len(self.fetched), 3)
+
+    def test_every_source_wrong_fails_in_russian_and_leaves_nothing(self):
+        cases = {'changed': dict(REPO_FILES, **{'uv.lock': 'evil'}),
+                 'extra': dict(REPO_FILES, **{'sitecustomize.py': 'import evil'}),
+                 'missing': {k: v for k, v in REPO_FILES.items() if k != 'pyproject.toml'}}
+        for label, files in cases.items():
+            with self.subTest(label):
+                for url in e.MARKETPLACES_ZIP_SOURCES:
+                    self.served[url] = repo_zip(files)
+                with self.assertRaises(e.Failure) as ctx:
+                    self.install()
+                self.assertIn('не совпал с проверенной версией', str(ctx.exception.args))
+                self.assertFalse(e.marketplaces_paths(self.home)['repo'].exists())
+                self.assertEqual(self.syncs(), [], 'nothing from an unverified tree may run')
+                self.assertEqual([p.name for p in (self.home / 'mcp').iterdir()], [], 'work dir must be removed')
+
+    def test_all_sources_unreachable_is_a_download_failure(self):
+        self.served.clear()
+        with self.assertRaises(e.Failure) as ctx:
+            self.install()
+        self.assertIn('не скачался', str(ctx.exception.args))
+
+    def test_manifest_for_another_commit_is_refused(self):
+        self.manifest.write_bytes(self.manifest.read_bytes().replace(e.MARKETPLACES_COMMIT.encode(), b'0' * 40))
+        with self.assertRaises(e.Failure):
+            self.install()
+        self.assertEqual(self.fetched, [])
+
+    def test_shipped_manifest_describes_the_pin(self):
+        expected = e.read_tree_manifest(ASSETS / e.MARKETPLACES_MANIFEST, e.MARKETPLACES_COMMIT)
+        self.assertGreater(len(expected), 100)
+        self.assertIn('uv.lock', expected)
+        # MAX_PATH: deepest file under the extraction work dir with a 32-char profile name.
+        home = 'C:\\Users\\' + 'u' * 32 + '\\AppData\\Local\\hermes'
+        work = home + '\\mcp\\.dl-12345678\\x2\\ru-marketplace-mcp-' + e.MARKETPLACES_COMMIT + '\\'
+        self.assertLess(len(work) + max(len(p) for p in expected), 240)
+
+    # --- Python 3.12 --------------------------------------------------------------------
+
+    def test_python_install_retries_through_proxies(self):
+        def runner(cmd, cwd, timeout, env):
+            self.runs.append((cmd, env))
+            if 'python' in cmd and 'install' in cmd:
+                return 0 if env.get('UV_PYTHON_INSTALL_MIRROR', '').startswith('https://gh-proxy.com/') else 2
+            return self._sync(cmd, cwd)
+        self.install(runner=runner)
+        installs = [(cmd, env) for cmd, env in self.runs if 'install' in cmd]
+        self.assertEqual([env.get('UV_PYTHON_INSTALL_MIRROR') for _, env in installs],
+                         [None, 'https://ghproxy.net/' + e.PYTHON_BUILDS_URL, 'https://gh-proxy.com/' + e.PYTHON_BUILDS_URL])
+        self.assertEqual(installs[0][0][1:], ['python', 'install', '--no-config', '3.12'])
+        sync_env = [env for cmd, env in self.runs if 'sync' in cmd][0]
+        self.assertEqual(sync_env.get('UV_PYTHON_DOWNLOADS'), 'never')
+        self.assertNotIn('UV_PYTHON_INSTALL_MIRROR', sync_env)
+
+    def test_first_python_route_success_needs_no_mirror(self):
+        self.install()
+        installs = [env for cmd, env in self.runs if 'install' in cmd]
+        self.assertEqual(len(installs), 1)
+        self.assertNotIn('UV_PYTHON_INSTALL_MIRROR', installs[0])
+
+    def test_inherited_hash_source_override_is_dropped(self):
+        import os
+        old = dict(os.environ)
+        os.environ['UV_PYTHON_DOWNLOADS_JSON_URL'] = 'https://evil.example/meta.json'
+        os.environ['UV_PYTHON_INSTALL_MIRROR'] = 'https://evil.example/'
+        try:
+            self.install()
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
+        for _, env in self.runs:
+            self.assertNotIn('UV_PYTHON_DOWNLOADS_JSON_URL', env)
+            self.assertNotEqual(env.get('UV_PYTHON_INSTALL_MIRROR'), 'https://evil.example/')
+
+    def _sync(self, cmd, cwd):
+        py = Path(cwd) / '.venv' / 'Scripts' / 'python.exe'
+        py.parent.mkdir(parents=True, exist_ok=True)
+        py.write_bytes(b'')
+        return 0
 
     def test_failed_sync_raises_and_retry_cleans_up(self):
         with self.assertRaises(Exception):

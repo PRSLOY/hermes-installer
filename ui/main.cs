@@ -21,7 +21,19 @@ namespace HermesSetup
         // Telegram actions only (telegram_pending / telegram_approve).
         public string TelegramStatus;
         public TelegramRequest[] TelegramRequests = new TelegramRequest[0];
-        public static Outcome Failure(string text) { return new Outcome { Message = text }; }
+        // Failure only: the protocol error code (AUTH, QUOTA, ...), or one of the two codes the
+        // UI itself produces when it stops the worker. The UI decides by this, never by text.
+        public string Code;
+        public const string CodeCancelled = "CANCELLED", CodeTimeout = "TIMEOUT";
+        public bool Cancelled { get { return Code == CodeCancelled; } }
+        // "CODE: text" messages carry their code; any other text has none.
+        public static Outcome Failure(string text)
+        {
+            int colon = text == null ? -1 : text.IndexOf(':');
+            string code = colon > 0 && Protocol.ErrorAdvice(text.Substring(0, colon)) != null ? text.Substring(0, colon) : null;
+            return Failure(code, text);
+        }
+        public static Outcome Failure(string code, string text) { return new Outcome { Code = code, Message = text }; }
     }
 
     public sealed class TelegramRequest
@@ -157,7 +169,7 @@ namespace HermesSetup
                     string code = Text(record, "code");
                     string advice = ErrorAdvice(code);
                     if (advice == null) throw new FormatException();
-                    final = Outcome.Failure(code + ": " + advice + "\r\n" + SafeText(message));
+                    final = Outcome.Failure(code, code + ": " + advice + "\r\n" + SafeText(message));
                     terminal = true;
                     return;
                 }

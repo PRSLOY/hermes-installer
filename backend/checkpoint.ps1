@@ -157,21 +157,39 @@ function Wait-StageJob([int]$Seconds = 180) {
     if ($script:StageJob) { Remove-Job -Job $script:StageJob -Force -ErrorAction SilentlyContinue; $script:StageJob = $null }
 }
 function Preserve-IncompleteInstall($State) {
+    # An interrupted install (Cancel, closed window, network drop, crash) is parked
+    # aside untouched and a clean copy of the same pinned version is installed.
+    # Nothing from the parked tree is ever executed or reused, so its content does
+    # not need to match the last checkpoint: that mismatch is the NORMAL state after
+    # a cancel (the tree hash is taken in the background and lags), and failing on it
+    # turned «Повторить» into a permanent «обратитесь в поддержку» (v0.1.2 review).
+    # Kept guards: never move a tree another installer run is still writing, and
+    # never move a profile that carries settings, keys or a completed install.
     $f=@($State.fingerprints)
-    if ($f.Count -ne 4) { Fail 'CONFIG' 'Нет пригодной контрольной точки установки. Частичные файлы сохранены; обратитесь в поддержку.' }
-    $child=Get-Process -Id ([int]$f[2]) -ErrorAction SilentlyContinue
-    if ($child -and [string]$child.StartTime.ToUniversalTime().Ticks -ceq $f[3]) { Fail 'CONFIG' 'Предыдущая установка ещё выполняется. Дождитесь её окончания и повторите.' }
-    # Never move completed/credential-bearing profiles, including externally added config.
-    foreach ($name in @('config.yaml','.env','hermes-agent\.hermes-bootstrap-complete')) {
-        if (Test-Path -LiteralPath (Join-Path $State.home $name)) { Fail 'CONFIG' 'Обнаружены файлы настроек или завершения установки. Автоматическое восстановление отменено; файлы сохранены.' }
+    if ($f.Count -eq 4) {
+        $child=Get-Process -Id ([int]$f[2]) -ErrorAction SilentlyContinue
+        if ($child -and [string]$child.StartTime.ToUniversalTime().Ticks -ceq $f[3]) { Fail 'CONFIG' 'Предыдущая установка ещё выполняется. Дождитесь её окончания и повторите.' }
     }
-    if ((Install-TreeHash $State.home) -cne $f[0]) { Fail 'CONFIG' 'Незавершённая установка изменилась после последней контрольной точки. Файлы сохранены; обратитесь в поддержку.' }
+    # During phase 'installing' the vendor only copies templates (install.ps1
+    # Stage-ConfigTemplates: .env <- .env.example, config.yaml <- cli-config.yaml.example);
+    # our key is written later by configure.py. So a template copy (or an empty .env)
+    # holds no secret and may be parked; anything else might be the person's own
+    # settings or keys and stops the automatic recovery. The bootstrap marker only
+    # means the vendor finished before the interruption: still no key, safe to park.
+    foreach ($pair in @(@('config.yaml','hermes-agent\cli-config.yaml.example'),@('.env','hermes-agent\.env.example'))) {
+        $file=Join-Path $State.home $pair[0]
+        if (-not (Test-Path -LiteralPath $file)) { continue }
+        $bytes=[IO.File]::ReadAllBytes($file)
+        $template=Join-Path $State.home $pair[1]
+        $isTemplate=($bytes.Length -eq 0) -or ((Test-Path -LiteralPath $template -PathType Leaf) -and ([Convert]::ToBase64String($bytes) -ceq [Convert]::ToBase64String([IO.File]::ReadAllBytes($template))))
+        if (-not $isTemplate) { Fail 'CONFIG' 'Обнаружены файлы настроек или завершения установки. Автоматическое восстановление отменено; файлы сохранены.' }
+    }
     if (Test-Path -LiteralPath $State.home) {
         $park=$State.home+'.subscriber-preserved-'+[Guid]::NewGuid().ToString('N')
         $null=Assert-SafePath $park
         # Same-volume no-overwrite rename. Do not rerun vendor over any existing tree.
         [IO.Directory]::Move($State.home,$park)
-        Send-Event @{type='progress';message=('Незавершённая установка сохранена в ' + $park + '. Запускаю чистую установку той же версии заново.')}
+        Send-Event @{type='progress';message=('Прошлая установка была прервана. Её файлы отложены в ' + $park + ' (их можно удалить). Ставлю заново.')}
     }
     $State.fingerprints=@(); Write-Journal $State
 }

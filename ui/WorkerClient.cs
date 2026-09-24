@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 
@@ -16,7 +17,7 @@ namespace HermesSetup
     }
     public sealed class Request
     {
-        public const int MaxFallbacks = 2;
+        public const int MaxFallbacks = 3;   // primary + 3 backups = every shipped preset
         public int protocol = 1;
         public string action = "install";
         public string endpoint, api_key, model, provider_name;
@@ -68,7 +69,7 @@ namespace HermesSetup
         public string ValidateFallbacks()
         {
             if (fallbacks == null) return null;
-            if (fallbacks.Count > MaxFallbacks) return "Можно добавить не больше двух запасных ключей.";
+            if (fallbacks.Count > MaxFallbacks) return "Можно добавить не больше трёх запасных ключей.";
             var ids = new HashSet<string>(StringComparer.Ordinal);
             var endpoints = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             endpoints.Add(endpoint);
@@ -143,6 +144,15 @@ namespace HermesSetup
             foreach(var entry in inherited) psi.EnvironmentVariables[entry.Key]=entry.Value;
             return psi;
         }
+        // Hung-worker guard: this long without a single stdout record = the worker is stuck.
+        // Its longest own child bound is 40 min (install.ps1) and it streams stage records,
+        // so 90 silent minutes are never a healthy install.
+        public static readonly TimeSpan InstallSilenceLimit = TimeSpan.FromMinutes(90);
+        // Telegram actions print only their terminal record; the worker bounds telegram.py at 300 s.
+        public static readonly TimeSpan TelegramLimit = TimeSpan.FromMinutes(8);
+        public const string StoppedMessage = "Установка остановлена. Скачанные файлы не удалены. Нажмите «Повторить», чтобы запустить установку снова, или измените провайдера и ключ.";
+        public const string HungMessage = "Установка слишком долго не сообщала о ходе работы и остановлена. Проверьте интернет или VPN и нажмите «Повторить». Скачанные файлы не удалены.";
+
         public static async Task<Outcome> RunAsync(string worker, Request request, Action<string> progress)
         { return await RunAsync(worker, request, progress, LaunchPolicy.Validate, null); }
         // Tests may inject a launch validator. Production calls the overload above only.
@@ -150,39 +160,69 @@ namespace HermesSetup
         { return await RunAsync(worker, request, progress, validator, null); }
         // The wizard subscribes to the structured stage id (auto-mapped to a human
         // phrase) while keeping the same numbered progress text in the journal.
-        public static Task<Outcome> RunAsync(string worker, Request request, Action<string> progress, Action<int,int,string> stage)
-        { return RunAsync(worker, request, progress, LaunchPolicy.Validate, stage); }
-        public static async Task<Outcome> RunAsync(string worker, Request request, Action<string> progress, Func<string,string[],bool> validator, Action<int,int,string> stage)
+        // Cancelling the token kills the worker's whole process tree.
+        public static Task<Outcome> RunAsync(string worker, Request request, Action<string> progress, Action<int,int,string> stage, CancellationToken cancel)
+        { return RunAsync(worker, request, progress, LaunchPolicy.Validate, stage, cancel, InstallSilenceLimit); }
+        public static Task<Outcome> RunAsync(string worker, Request request, Action<string> progress, Func<string,string[],bool> validator, Action<int,int,string> stage)
+        { return RunAsync(worker, request, progress, validator, stage, CancellationToken.None, InstallSilenceLimit); }
+        // Tests inject a short silence limit to drive the hung-worker path.
+        public static async Task<Outcome> RunAsync(string worker, Request request, Action<string> progress, Func<string,string[],bool> validator, Action<int,int,string> stage, CancellationToken cancel, TimeSpan silenceLimit)
         {
             string error = request.Validate();
-            if(error!=null) return Outcome.Failure(error);
+            if(error!=null) return Outcome.Failure("INPUT", error);
             if(!File.Exists(worker)) return Outcome.Failure("INSTALL: Не найден backend/worker.ps1. Распакуйте весь ZIP в одну папку и запустите HermesSetup.exe оттуда.");
             var protocol = new Protocol(request.api_key,progress,validator);
             protocol.ExtraSecrets = request.Secrets();
             if (stage != null) protocol.StageProgress = stage;
+            byte[] bytes = new UTF8Encoding(false,true).GetBytes(new JavaScriptSerializer().Serialize(request)+"\n");
+            try { return await Execute(worker, bytes, protocol, false, cancel, silenceLimit); }
+            finally { Array.Clear(bytes,0,bytes.Length); }
+        }
+        // One worker session: one JSON object on stdin, NDJSON out, exactly one terminal record.
+        // The whole process tree lives in a job: cancel or silenceLimit without any stdout record
+        // kills all of it. The install job also dies with the window (killOnClose); a Telegram
+        // action is left to finish if the window closes, as before (a gateway restart cut in
+        // half would leave the bot stopped).
+        static async Task<Outcome> Execute(string worker, byte[] payload, Protocol protocol, bool telegram, CancellationToken cancel, TimeSpan silenceLimit)
+        {
+            using(var job = new ProcessJob(!telegram))
             using(var process = new Process { StartInfo=StartInfo(worker) })
             {
                 try
                 {
-                    if(!process.Start()) return Outcome.Failure("INSTALL: Не удалось запустить Windows PowerShell. Обратитесь в поддержку.");
+                    if(!process.Start()) return Outcome.Failure(telegram ? "INSTALL: Не удалось запустить Windows PowerShell." : "INSTALL: Не удалось запустить Windows PowerShell. Обратитесь в поддержку.");
                 }
-                catch { return Outcome.Failure("INSTALL: Windows заблокировала запуск установщика или PowerShell недоступен. Обратитесь в поддержку; не отключайте защиту Windows."); }
-                Task stdout = Task.Run(delegate { ReadLines(process.StandardOutput, protocol); });
+                catch { return Outcome.Failure(telegram ? "INSTALL: Windows заблокировала запуск PowerShell." : "INSTALL: Windows заблокировала запуск установщика или PowerShell недоступен. Обратитесь в поддержку; не отключайте защиту Windows."); }
+                job.Assign(process);
+                var lastRecord = new long[] { DateTime.UtcNow.Ticks };
+                Task stdout = Task.Run(delegate { ReadLines(process.StandardOutput, protocol, lastRecord); });
                 Task<bool> stderr = Task.Run(delegate {
                     bool any=false; char[] chars=new char[1024];
                     try { int n; while((n=process.StandardError.Read(chars,0,chars.Length))>0) any=true; }
                     catch { any=true; } return any;
                 });
                 bool writeFailed=false;
-                try
-                {
-                    byte[] bytes = new UTF8Encoding(false,true).GetBytes(new JavaScriptSerializer().Serialize(request)+"\n");
-                    try { await process.StandardInput.BaseStream.WriteAsync(bytes,0,bytes.Length); await process.StandardInput.BaseStream.FlushAsync(); }
-                    finally { Array.Clear(bytes,0,bytes.Length); }
-                }
+                try { await process.StandardInput.BaseStream.WriteAsync(payload,0,payload.Length); await process.StandardInput.BaseStream.FlushAsync(); }
                 catch { writeFailed=true; }
                 finally { try { process.StandardInput.Close(); } catch {} }
-                await Task.Run(delegate { process.WaitForExit(); });
+                string stop = await Task.Run(delegate {
+                    while(!process.WaitForExit(250))
+                    {
+                        if(cancel.IsCancellationRequested) return Outcome.CodeCancelled;
+                        if(DateTime.UtcNow.Ticks - Interlocked.Read(ref lastRecord[0]) > silenceLimit.Ticks) return Outcome.CodeTimeout;
+                    }
+                    return null;
+                });
+                if(stop!=null)
+                {
+                    job.Kill();
+                    await Task.Run(delegate { process.WaitForExit(15000); });
+                    // Bounded drain: a descendant that broke away may still hold a pipe open.
+                    await Task.WhenAny(Task.WhenAll(stdout, stderr), Task.Delay(5000));
+                    if(stop==Outcome.CodeCancelled) return Outcome.Failure(Outcome.CodeCancelled, StoppedMessage);
+                    return Outcome.Failure(Outcome.CodeTimeout, telegram ? "Телеграм не ответил вовремя, проверка остановлена. Повторите через минуту." : HungMessage);
+                }
+                job.Release();
                 await stdout;
                 if(await stderr || writeFailed) protocol.Invalidate();
                 return protocol.Finish(process.ExitCode);
@@ -191,7 +231,10 @@ namespace HermesSetup
         // Short Done-screen actions: "telegram_pending" (no arguments) or "telegram_approve"
         // (request id + user id picked by the owner's click). Same process contract as install:
         // one JSON object on stdin, NDJSON out, exactly one terminal record.
-        public static async Task<Outcome> RunTelegramAsync(string worker, string action, string requestId, string userId)
+        public static Task<Outcome> RunTelegramAsync(string worker, string action, string requestId, string userId)
+        { return RunTelegramAsync(worker, action, requestId, userId, TelegramLimit); }
+        // Tests inject a short limit to drive the hung-action path.
+        public static async Task<Outcome> RunTelegramAsync(string worker, string action, string requestId, string userId, TimeSpan limit)
         {
             var payload = new Dictionary<string,object> { { "protocol", 1 }, { "action", action } };
             if (action == "telegram_approve")
@@ -202,31 +245,10 @@ namespace HermesSetup
             else if (action != "telegram_pending") return Outcome.Failure("INPUT: Неизвестное действие.");
             if(!File.Exists(worker)) return Outcome.Failure("INSTALL: Не найден backend/worker.ps1. Распакуйте весь ZIP в одну папку и запустите HermesSetup.exe оттуда.");
             var protocol = new Protocol(null, delegate { }, delegate(string p, string[] a) { return false; }) { TelegramMode = true };
-            using(var process = new Process { StartInfo=StartInfo(worker) })
-            {
-                try { if(!process.Start()) return Outcome.Failure("INSTALL: Не удалось запустить Windows PowerShell."); }
-                catch { return Outcome.Failure("INSTALL: Windows заблокировала запуск PowerShell."); }
-                Task stdout = Task.Run(delegate { ReadLines(process.StandardOutput, protocol); });
-                Task<bool> stderr = Task.Run(delegate {
-                    bool any=false; char[] chars=new char[1024];
-                    try { int n; while((n=process.StandardError.Read(chars,0,chars.Length))>0) any=true; }
-                    catch { any=true; } return any;
-                });
-                bool writeFailed=false;
-                try
-                {
-                    byte[] bytes = new UTF8Encoding(false,true).GetBytes(new JavaScriptSerializer().Serialize(payload)+"\n");
-                    await process.StandardInput.BaseStream.WriteAsync(bytes,0,bytes.Length); await process.StandardInput.BaseStream.FlushAsync();
-                }
-                catch { writeFailed=true; }
-                finally { try { process.StandardInput.Close(); } catch {} }
-                await Task.Run(delegate { process.WaitForExit(); });
-                await stdout;
-                if(await stderr || writeFailed) protocol.Invalidate();
-                return protocol.Finish(process.ExitCode);
-            }
+            byte[] bytes = new UTF8Encoding(false,true).GetBytes(new JavaScriptSerializer().Serialize(payload)+"\n");
+            return await Execute(worker, bytes, protocol, true, CancellationToken.None, limit);
         }
-        static void ReadLines(StreamReader reader, Protocol protocol)
+        static void ReadLines(StreamReader reader, Protocol protocol, long[] lastRecord)
         {
             // Bounded NDJSON framing even if the backend misbehaves. Drain after an oversized line.
             var line = new StringBuilder(); bool overflow=false;
@@ -237,6 +259,7 @@ namespace HermesSetup
                 {
                     if(value=='\n')
                     {
+                        Interlocked.Exchange(ref lastRecord[0], DateTime.UtcNow.Ticks);
                         if(overflow) protocol.Invalidate();
                         else protocol.Feed(line.ToString().TrimEnd('\r'));
                         line.Clear(); overflow=false;

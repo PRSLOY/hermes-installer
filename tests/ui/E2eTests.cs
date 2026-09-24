@@ -1,6 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
+using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using HermesSetup;
 
@@ -107,11 +110,84 @@ public static class E2eTests
             // 6. Missing worker script: actionable INSTALL failure, not a crash.
             var missing = WorkerClient.RunAsync(Path.Combine(temp, "absent", "backend", "worker.ps1"), new Request { endpoint="https://mock.test/v1", api_key="MOCKKEY12345" }, delegate { }).GetAwaiter().GetResult();
             Check(!missing.Success && missing.Message.Contains("backend"), "missing worker script produces actionable error");
+
+            // 7. «Отменить» on a worker that never exits: the whole tree dies, including a
+            // grandchild whose parent already exited (the orphan `taskkill /T` cannot reach).
+            string cancelPids = Path.Combine(temp, "cancel.pids"), cancelOrphan = Path.Combine(temp, "cancel.orphan");
+            string cancelWorker = HangWorker(Path.Combine(temp, "cancel", "backend"), cancelPids, cancelOrphan);
+            var cancel = new CancellationTokenSource();
+            var stopped = WorkerClient.RunAsync(cancelWorker, new Request { endpoint="https://mock.test/v1", api_key="MOCKKEY12345" },
+                delegate(string m) { if (m == "hanging") cancel.Cancel(); }, delegate(string p, string[] a) { return true; }, null,
+                cancel.Token, TimeSpan.FromMinutes(90)).GetAwaiter().GetResult();
+            Check(stopped.Cancelled && !stopped.Success && stopped.Message.Contains("остановлена"), "cancel stops a worker that never exits; the outcome says «остановлена» got="+stopped.Code);
+            Check(AllGone(cancelPids, cancelOrphan), "cancel leaves no process behind: worker, child and orphaned grandchild are gone (by PID)");
+
+            // 8. Hung worker: one record, then silence past the (injected) limit = tree killed, error shown.
+            string hungPids = Path.Combine(temp, "hung.pids"), hungOrphan = Path.Combine(temp, "hung.orphan");
+            string hungWorker = HangWorker(Path.Combine(temp, "hung", "backend"), hungPids, hungOrphan);
+            var hung = WorkerClient.RunAsync(hungWorker, new Request { endpoint="https://mock.test/v1", api_key="MOCKKEY12345" }, delegate { },
+                delegate(string p, string[] a) { return true; }, null, CancellationToken.None, TimeSpan.FromSeconds(15)).GetAwaiter().GetResult();
+            Check(!hung.Success && hung.Code == Outcome.CodeTimeout && hung.Message == WorkerClient.HungMessage, "silence past the limit stops the install with the hung-worker error got="+hung.Code);
+            Check(AllGone(hungPids, hungOrphan), "hung-worker stop leaves no process behind (by PID)");
+
+            // 9. Telegram actions are bounded too.
+            string tgPids = Path.Combine(temp, "tg.pids"), tgOrphan = Path.Combine(temp, "tg.orphan");
+            string tgWorker = HangWorker(Path.Combine(temp, "tg", "backend"), tgPids, tgOrphan);
+            var tg = WorkerClient.RunTelegramAsync(tgWorker, "telegram_pending", null, null, TimeSpan.FromSeconds(15)).GetAwaiter().GetResult();
+            Check(!tg.Success && tg.Code == Outcome.CodeTimeout, "a hung Telegram action ends with a timeout instead of waiting forever got="+tg.Code);
+            Check(AllGone(tgPids, tgOrphan), "hung Telegram action leaves no process behind (by PID)");
         }
         finally
         {
+            // Never leave test pings running, even when a check above failed.
+            foreach (string file in Directory.Exists(temp) ? Directory.GetFiles(temp) : new string[0])
+                foreach (int pid in Pids(file)) try { using (var p = Process.GetProcessById(pid)) p.Kill(); } catch {}
             try { Directory.Delete(temp, true); } catch {}
         }
         return Environment.ExitCode;
+    }
+
+    // Mock worker that never exits: reads the request, starts ping as a direct child and, via
+    // an intermediate PowerShell that exits at once, a second ping whose parent is dead. It
+    // records all PIDs, then prints one progress record ("hanging") and sleeps forever.
+    static string HangWorker(string directory, string pidFile, string orphanFile)
+    {
+        string grand = "$si = New-Object Diagnostics.ProcessStartInfo 'ping.exe', '-n 600 127.0.0.1'; $si.UseShellExecute = $false; $si.CreateNoWindow = $true; " +
+            "$p = [Diagnostics.Process]::Start($si); [IO.File]::WriteAllText('" + orphanFile + "', [string]$p.Id)";
+        string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(grand));
+        return WriteWorker(directory, "$ErrorActionPreference='Stop'\r\n" +
+            "[void]([Console]::In.ReadToEnd())\r\n" +
+            "$si = New-Object Diagnostics.ProcessStartInfo 'ping.exe', '-n 600 127.0.0.1'\r\n$si.UseShellExecute = $false; $si.CreateNoWindow = $true\r\n" +
+            "$kid = [Diagnostics.Process]::Start($si)\r\n" +
+            "$gi = New-Object Diagnostics.ProcessStartInfo (Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'), '-NoProfile -NonInteractive -EncodedCommand " + encoded + "'\r\n" +
+            "$gi.UseShellExecute = $false; $gi.CreateNoWindow = $true\r\n$mid = [Diagnostics.Process]::Start($gi); $mid.WaitForExit()\r\n" +
+            "[IO.File]::WriteAllText('" + pidFile + "', ([string]$PID + ' ' + $kid.Id))\r\n" +
+            "[Console]::Out.WriteLine('{\"type\":\"progress\",\"message\":\"hanging\"}')\r\n" +
+            "while ($true) { Start-Sleep -Milliseconds 200 }\r\n");
+    }
+    static List<int> Pids(string file)
+    {
+        var list = new List<int>();
+        try { foreach (string part in File.ReadAllText(file).Split(' ')) { int pid; if (int.TryParse(part.Trim(), out pid)) list.Add(pid); } } catch {}
+        return list;
+    }
+    static bool Alive(int pid)
+    {
+        try { using (var p = Process.GetProcessById(pid)) return !p.HasExited; }
+        catch { return false; }
+    }
+    // Both PID files must exist (the tree really started) and every PID must be gone within 10 s.
+    static bool AllGone(string pidFile, string orphanFile)
+    {
+        var pids = Pids(pidFile); pids.AddRange(Pids(orphanFile));
+        if (pids.Count != 3) return false;
+        for (int i = 0; i < 40; i++)
+        {
+            bool any = false;
+            foreach (int pid in pids) if (Alive(pid)) any = true;
+            if (!any) return true;
+            Thread.Sleep(250);
+        }
+        return false;
     }
 }

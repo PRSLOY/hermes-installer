@@ -62,6 +62,8 @@ Windows в России у него тихо ломается половина: 
 - Ключ хранится только у вас на компьютере в защищённом файле Hermes. В логи
   и отчёты он не попадает.
 - Телеграм-бот отвечает только тем, кого вы одобрили.
+- Если GitHub недоступен, код Hermes, Git и компоненты скачиваются через зеркала, но каждый файл сверяется с SHA-256 проверенной версии (для кода Hermes — все 13 773 файла закреплённого коммита). Подменённый файл с зеркала не пройдёт, установка остановится.
+- Установку можно отменить в любой момент; повторный запуск откладывает незаконченную установку в сторону и ставит заново.
 - Установщик не отключает защиту Windows. Права администратора Windows
   спрашивает, только когда без них никак. Например, для компонента Microsoft
   Visual C++, который нужен для распознавания голоса. Этот файл скачивается с
@@ -78,7 +80,9 @@ powershell -ExecutionPolicy Bypass -File .\package-dist.ps1   # собирает
 Тесты:
 
 ```powershell
-python -m pytest tests\backend -q      # нужен Python 3.12 с pytest и pyyaml
+python -m pip install pytest pyyaml httpx certifi websockets python-dotenv
+python -m pytest tests\backend -q      # нужен Python 3.12
+python -m pytest tests\test_clean_package.py -q   # сборка пакета с нуля
 powershell -File tests\ui\run.ps1      # тесты интерфейса; запускать в Windows Sandbox
 ```
 

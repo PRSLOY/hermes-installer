@@ -77,7 +77,9 @@ except Failure as e:
         return events[-1]
 
     def test_damaged_checkpoint_and_external_edits_fail_closed(self):
-        for kind in ('missing', 'corrupt', 'foreign', 'config', 'env', 'head', 'exe', 'partial', 'junction', 'phase', 'revision', 'schema', 'extra', 'owner', 'fingerprints'):
+        # 'partial' (an interrupted install) is no longer a refusal: see
+        # test_interrupted_install_is_parked_and_reinstalled.
+        for kind in ('missing', 'corrupt', 'foreign', 'config', 'env', 'head', 'exe', 'junction', 'phase', 'revision', 'schema', 'extra', 'owner', 'fingerprints'):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory(prefix='subscriber-negative-') as tmp:
                 root=Path(tmp)
                 first='PARTIAL' if kind=='partial' else 'AUTH'
@@ -112,6 +114,49 @@ except Failure as e:
                         if kind==k: self.assertEqual((root/'hermes'/rel).read_text(),'EXTERNAL KEEP')
                 finally:
                     if junction is not None: os.rmdir(junction)
+
+    def set_phase(self, root, phase):
+        cmd=(f". '{ROOT/'backend/worker.ps1'}'; $h=Assert-SafePath '{root/'hermes'}'; $r=Assert-SafePath '{root/'hermes/hermes-agent'}'; "
+             f"$pin=(Get-Content '{ROOT/'backend/upstream/commit.txt'}' -Raw).Trim(); "
+             f"$s=Read-Journal $h $r $pin ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value); $s.phase='{phase}'; Write-Journal $s")
+        done=subprocess.run([PS,'-NoProfile','-Command',cmd],capture_output=True)
+        self.assertEqual(done.returncode,0,done.stderr)
+
+    def test_interrupted_install_is_parked_and_reinstalled(self):
+        """Cancel/network drop mid-install: «Повторить» must reinstall, not dead-end.
+
+        The interrupted tree (vendor template config.yaml, no key) is moved aside
+        untouched and a clean install of the same pin runs; no checkpoint needed.
+        """
+        with tempfile.TemporaryDirectory(prefix='subscriber-interrupted-') as tmp:
+            root=Path(tmp)
+            self.assertEqual(self.run_worker(root, 'PARTIAL')['code'], 'INSTALL')
+            (root/'hermes/partial-download.bin').write_text('half')
+            result=self.run_worker(root, 'OK', corrected=True)
+            self.assertEqual(result['type'], 'success', result)
+            self.assertEqual((root/'calls.txt').read_text().splitlines(), ['install', 'install', 'configure:corrected'])
+            parked=[p for p in root.iterdir() if p.name.startswith('hermes.subscriber-preserved-')]
+            self.assertEqual(len(parked), 1)
+            self.assertEqual((parked[0]/'partial-download.bin').read_text(), 'half')
+
+    def test_interrupted_install_with_foreign_settings_is_not_moved(self):
+        with tempfile.TemporaryDirectory(prefix='subscriber-interrupted-foreign-') as tmp:
+            root=Path(tmp)
+            self.assertEqual(self.run_worker(root, 'PARTIAL')['code'], 'INSTALL')
+            (root/'hermes/.env').write_text('SOMEONE_ELSES_SECRET=keep')
+            self.assertEqual(self.run_worker(root, 'OK')['code'], 'CONFIG')
+            self.assertEqual((root/'hermes/.env').read_text(), 'SOMEONE_ELSES_SECRET=keep')
+            self.assertEqual((root/'calls.txt').read_text().splitlines(), ['install'])
+
+    def test_interrupted_key_check_is_retried(self):
+        """Cancel during the key check left phase 'configuring': the next run checks again."""
+        with tempfile.TemporaryDirectory(prefix='subscriber-configuring-') as tmp:
+            root=Path(tmp)
+            self.assertEqual(self.run_worker(root, 'AUTH')['code'], 'AUTH')
+            self.set_phase(root, 'configuring')
+            result=self.run_worker(root, 'OK', corrected=True)
+            self.assertEqual(result['type'], 'success', result)
+            self.assertEqual((root/'calls.txt').read_text().splitlines(), ['install', 'configure:initial', 'configure:corrected'])
 
     def test_configure_rejects_forged_fresh_before_network(self):
         import sys

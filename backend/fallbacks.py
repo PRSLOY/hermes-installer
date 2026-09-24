@@ -37,7 +37,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from provider import Failure, base_url_candidates, select_model
 
-MAX_FALLBACKS = 2
+MAX_FALLBACKS = 3
 ENV_NAME = 'HERMES_SUBSCRIBER_FALLBACK_{}_KEY'
 KEY_RE = re.compile(r'^[\x21-\x7E]{8,8192}$')
 ID_RE = re.compile(r'^[A-Za-z0-9_.-]{1,64}$')

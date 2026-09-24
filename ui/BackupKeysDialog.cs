@@ -13,7 +13,7 @@ namespace HermesSetup
         public string Key;
     }
 
-    // Modal "Запасные ключи" dialog: up to two rows of [provider][key][Вставить из буфера][Убрать],
+    // Modal "Запасные ключи" dialog: up to three rows of [provider][key][Вставить из буфера][Убрать],
     // «Ещё один», ОК/Отмена. Validation errors stay inside the dialog. It lives outside the
     // key screen so that screen keeps its 560x500 budget (sandbox layout run 2026-09-23:
     // inline rows overflowed the footer by 111 px).
@@ -62,7 +62,7 @@ namespace HermesSetup
             Font = UiTheme.Font(10F);
             AutoScaleMode = AutoScaleMode.Dpi;
             AutoScaleDimensions = new SizeF(96F, 96F);
-            ClientSize = new Size(560, 400);   // 330 clipped 2 rows + error by 34 px (sandbox layout test)
+            ClientSize = new Size(560, 450);   // 3 rows + error; 330 clipped 2 rows + error by 34 px (sandbox layout test)
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false; MinimizeBox = false; ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterParent;

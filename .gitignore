@@ -9,3 +9,6 @@ __pycache__/
 .scratch/
 qa/ui-run/
 qa/diag-out/
+tests/**/*.exe
+qa/ui-layout/
+dist/

@@ -2,3 +2,4 @@
 backend/upstream/** -text
 dist/backend/upstream/** -text
 *.exe binary
+assets/marketplaces/tree-manifest.sha256 -text

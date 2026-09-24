@@ -163,6 +163,38 @@ class LayoutTests {
        image.Save(Path.Combine(dir,names[page]+"-"+tag+".png"));
       }
      }
+     // «Отменить» in the footer while installing; then the stopped screen and a real, long
+     // INSTALL error, each with «Повторить» + «Изменить провайдера или ключ».
+     {
+      var runningField=typeof(InstallerForm).GetField("running",BindingFlags.NonPublic|BindingFlags.Instance);
+      var installPage=f.Controls.Find("PageInstall",true)[0];
+      var footer=f.Controls.Find("Footer",true)[0];
+      var cancelBtn=(Button)f.Controls.Find("CancelInstall",true)[0];
+      runningField.SetValue(f,true);
+      f.GoTo(InstallerForm.PageInstall); Settle(f);
+      int footerTop=f.PointToClient(footer.PointToScreen(Point.Empty)).Y;
+      Require(cancelBtn.Visible && cancelBtn.Enabled, tag+": «Отменить» is shown while installing");
+      CheckKeyPage(f,installPage,footerTop,tag+" install screen with «Отменить»");
+      Snap(f,dir,"screen3-cancel-"+tag);
+      runningField.SetValue(f,false);
+      var error=new Protocol(null,delegate{},delegate{return true;});
+      error.Feed("{\"type\":\"error\",\"code\":\"INSTALL\",\"message\":\"Официальная установка остановлена: этап repository, код 1. Скачивание кода Hermes не удалось. Проверьте интернет или VPN и повторите. Проверка API ещё не запускалась. Сохраните этот код для диагностики; не удаляйте папку установки.\"}");
+      var outcomes=new[]{ Outcome.Failure(Outcome.CodeCancelled,WorkerClient.StoppedMessage), error.Finish(1) };
+      string[] shots={"screen3-stopped-","screen3-error-"};
+      for(int o=0;o<outcomes.Length;o++) {
+       string where=tag+" "+shots[o].Trim('-');
+       f.GoTo(InstallerForm.PageInstall);
+       f.ShowFailure(outcomes[o]); Settle(f);
+       Require(!cancelBtn.Visible, where+": «Отменить» hidden once nothing runs");
+       var retry=(Button)f.Controls.Find("Action",true)[0];
+       var change=(Button)f.Controls.Find("ChangeProvider",true)[0];
+       Require(retry.Visible && change.Visible && retry.Text=="Повторить" && change.Text=="Изменить провайдера или ключ", where+": both actions shown");
+       footerTop=f.PointToClient(footer.PointToScreen(Point.Empty)).Y;
+       CheckKeyPage(f,installPage,footerTop,where);
+       Snap(f,dir,shots[o]+tag);
+      }
+      f.ChangeProviderOrKey(); Settle(f);
+     }
      // Expanded details must still fit, expose the log, and keep the user's scroll position.
      f.GoTo(InstallerForm.PageInstall);
      var details=f.Controls.Find("Details",true);
@@ -198,11 +230,13 @@ class LayoutTests {
      d.AutoScaleMode=AutoScaleMode.None;
      if(scale!=1) { d.Scale(new SizeF(scale,scale)); ScaleFonts(d,scale); }
      d.Show(); Settle(d);
-     d.AddRow();
+     d.AddRow(); d.AddRow();
+     int expected=Math.Min(Request.MaxFallbacks,candidates.Count);
      d.Keys[0].Text="LAYOUTFAKEKEY0"; d.Keys[1].Text="short";
+     if(expected>2) d.Keys[2].Text="LAYOUTFAKEKEY2";
      Require(d.TryAccept()!=null, tag+": a short key must be rejected");
      Settle(d);
-     Require(d.RowCount==2, tag+": two rows expected");
+     Require(d.RowCount==expected, tag+": "+expected+" rows expected, got "+d.RowCount);
      var content=d.Controls.Find("DialogContent",true); var footer=d.Controls.Find("DialogFooter",true);
      Require(content.Length==1 && footer.Length==1, tag+": dialog content and footer present");
      int footerTop=d.PointToClient(footer[0].PointToScreen(Point.Empty)).Y;
@@ -214,7 +248,7 @@ class LayoutTests {
      d.Close();
     }
    }
-   Console.WriteLine("PASS layout: 4 screens x 6 sizes, key screen with the backup summary per provider, backup dialog at 3 scales, nothing clipped, no in-window scrollbars, log scroll preserved; scaling is SIMULATED, not OS DPI.");
+   Console.WriteLine("PASS layout: 4 screens x 6 sizes plus install-with-cancel, stopped and error screens x 6 sizes, key screen with the backup summary per provider, backup dialog at 3 scales, nothing clipped, no in-window scrollbars, log scroll preserved; scaling is SIMULATED, not OS DPI.");
    return 0;
   } catch(Exception e) { Console.Error.WriteLine(e); return 1; }
  }

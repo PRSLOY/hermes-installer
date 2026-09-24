@@ -145,7 +145,53 @@ public static class UnitTests
         Check(new Request { endpoint = "https://x/v1", api_key = "ключ с пробелом" }.Validate() != null, "request validation rejects space in key");
         Check(new Request { endpoint = "https://x/v1", api_key = "TESTKEY123" }.Validate() == null, "request validation accepts well-formed request");
         FallbackTests(catalogPath);
+        FailureActionTests(catalogPath);
         return Environment.ExitCode;
+    }
+
+    // --- failure / stopped screen: two ways forward after ANY terminal outcome -------------
+    static void FailureActionTests(string catalogPath)
+    {
+        var auth = New(null); auth.Feed("{\"type\":\"error\",\"code\":\"AUTH\",\"message\":\"ключ отклонён\"}");
+        Check(auth.Finish(1).Code == "AUTH", "an error record carries its protocol code");
+        Check(New(null).Finish(0).Code == "INSTALL", "no terminal record = INSTALL code");
+        var garbage = New(null); garbage.Feed("{oops");
+        Check(garbage.Finish(0).Code == "VERIFY", "protocol violation = VERIFY code");
+        Check(Outcome.Failure("NETWORK: прокси AUTH-шлюза не отвечает").Code == "NETWORK", "the code is the message prefix, never a substring (AUTH inside a NETWORK text)");
+        Check(Outcome.Failure("Просто текст без кода").Code == null, "text without a known prefix has no code");
+        Check(!InstallerForm.StopQuestion.Contains("с того же места продолж") && InstallerForm.StopQuestion.Contains("заново"), "the stop question does not promise a resume the worker cannot do");
+
+        File.WriteAllText(catalogPath, "{\"providers\":[" +
+            "{\"id\":\"gwarden\",\"label\":\"GWarden\",\"endpoint\":\"https://gwarden.su/v1\",\"model\":\"glm-5.3\"}," +
+            "{\"id\":\"dahl\",\"label\":\"Dahl\",\"endpoint\":\"https://inference.dahl.global/v1\",\"model\":\"MiniMaxAI/MiniMax-M2.7\"}," +
+            "{\"id\":\"custom\",\"label\":\"Другой (точный адрес API)\"}]}");
+        try { using (var form = new InstallerForm()) {
+            foreach (string code in new[] { "QUOTA", "NETWORK", "CONFIG", "VERIFY", "INSTALL", "BUSY", "INTERNAL", Outcome.CodeTimeout, Outcome.CodeCancelled })
+            {
+                form.SelectProvider(1); form.ToggleModelField(); form.Model.Text = "kept-model"; form.ApiKey.Text = "PRIMARYKEY123";
+                form.GoTo(InstallerForm.PageInstall);
+                // The message mentions AUTH on purpose: only the code decides.
+                form.ShowFailure(Outcome.Failure(code, code + ": текст упоминает AUTH"));
+                var offered = form.FailureActions;
+                Check(offered.Length == 2 && offered[0] == "Повторить" && offered[1] == "Изменить провайдера или ключ", code + ": «Повторить» and «Изменить провайдера или ключ» are offered");
+                form.ChangeProviderOrKey();
+                Check(form.PageIndex == InstallerForm.PageChoose && form.SelectedProvider == 1 && form.Model.Text == "kept-model" &&
+                      form.ApiKey.TextLength == 0 && form.FailureActions.Length == 0, code + ": change goes to the provider screen, keeps the choices, clears the key");
+                form.ToggleModelField();
+            }
+            form.ApiKey.Text = "PRIMARYKEY123";
+            form.GoTo(InstallerForm.PageInstall);
+            form.ShowFailure(Outcome.Failure("AUTH", "AUTH: ключ отклонён"));
+            Check(form.FailureActions.Length == 2 && form.FailureActions[0] == "Повторить" && form.FailureActions[1] == "Изменить ключ", "AUTH: «Повторить» and «Изменить ключ»");
+            form.ChangeProviderOrKey();
+            Check(form.PageIndex == InstallerForm.PageKey && form.ApiKey.TextLength == 0, "AUTH: change goes straight to the key screen with the rejected key cleared");
+            form.SelectProvider(2);
+            form.Endpoint.Text = "other.test/custom/api"; form.ConfirmEndpoint.Checked = true;
+            form.GoTo(InstallerForm.PageInstall);
+            form.ShowFailure(Outcome.Failure("QUOTA", "QUOTA: лимит"));
+            form.ChangeProviderOrKey();
+            Check(form.IsCustomSelected && form.Endpoint.Text == "other.test/custom/api" && form.CanChoose, "a custom API address and its confirmation survive «Изменить провайдера»");
+        }} finally { File.Delete(catalogPath); }
     }
 
     // --- backup providers (issue #10) ------------------------------------------------
@@ -164,7 +210,8 @@ public static class UnitTests
         Check(ok.Validate() == null, "two well-formed backups are accepted");
         Check(ok.fallbacks[0].endpoint == "https://dahl.test/v1" && ok.fallbacks[0].api_key == "BACKUPKEY123", "backup endpoint normalized and key whitespace cleaned like the primary");
         Check(WithBackups().Validate() == null && new Request { endpoint = "https://x/v1", api_key = "TESTKEY123", fallbacks = null }.Validate() == null, "no backups is valid");
-        Check(WithBackups(Fb("a", "https://a.test/v1", "BACKUPKEY1"), Fb("b", "https://b.test/v1", "BACKUPKEY2"), Fb("c", "https://c.test/v1", "BACKUPKEY3")).Validate() != null, "more than two backups rejected");
+        Check(WithBackups(Fb("a", "https://a.test/v1", "BACKUPKEY1"), Fb("b", "https://b.test/v1", "BACKUPKEY2"), Fb("c", "https://c.test/v1", "BACKUPKEY3")).Validate() == null, "three backups are accepted (every shipped preset)");
+        Check(WithBackups(Fb("a", "https://a.test/v1", "BACKUPKEY1"), Fb("b", "https://b.test/v1", "BACKUPKEY2"), Fb("c", "https://c.test/v1", "BACKUPKEY3"), Fb("d", "https://d.test/v1", "BACKUPKEY4")).Validate() != null, "more than three backups rejected");
         Check(WithBackups(Fb("dahl", "https://a.test/v1", "BACKUPKEY1"), Fb("dahl", "https://b.test/v1", "BACKUPKEY2")).Validate() != null, "duplicate backup provider rejected");
         Check(WithBackups(Fb("a", "https://a.test/v1", "BACKUPKEY1"), Fb("b", "https://A.test/v1/", "BACKUPKEY2")).Validate() != null, "duplicate backup endpoint rejected");
         Check(WithBackups(Fb("p", "https://PRIMARY.test/v1/", "BACKUPKEY1")).Validate() != null, "backup equal to the primary endpoint rejected");
@@ -197,7 +244,7 @@ public static class UnitTests
                 d.AddRow();
                 Check(d.RowCount == 2 && Shown(d.Providers[1]) == "Atria", "«Ещё один» opens row 2 on a provider row 1 does not use");
                 d.AddRow();
-                Check(d.RowCount == 2, "never more than two rows");
+                Check(d.RowCount == 2, "never more rows than remaining providers (two here)");
                 d.Keys[1].Text = "short";
                 Check(d.TryAccept() != null && d.ErrorText.StartsWith("Запасной ключ 2"), "bad backup key is reported inside the dialog");
                 d.Keys[1].Text = "BACKUPKEY222";

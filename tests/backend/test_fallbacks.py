@@ -184,8 +184,8 @@ class FallbacksTests(unittest.TestCase):
         dup = self.run_stage([entry('a', 'https://a.example/v1', KEY1), entry('b', 'https://A.example/v1/', KEY2)], probe)
         self.assertEqual([r['status'] for r in dup['results']], ['added', 'failed'])
         self.assertEqual(len(probe.calls), 1)
-        self.assertEqual(self.run_stage([entry('a', 'https://a.example/v1', KEY1)] * 3, probe)['results'],
-                         [{'provider_id': 'a', 'status': 'failed'}] * 2)
+        self.assertEqual(self.run_stage([entry('a', 'https://a.example/v1', KEY1)] * (fb.MAX_FALLBACKS + 1), probe)['results'],
+                         [{'provider_id': 'a', 'status': 'failed'}] * fb.MAX_FALLBACKS)
 
     # --- idempotency ----------------------------------------------------------------
     def test_rerun_is_idempotent(self):

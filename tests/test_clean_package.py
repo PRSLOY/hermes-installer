@@ -15,7 +15,7 @@ class CleanPackageTest(unittest.TestCase):
     def test_package_builds_without_existing_dist(self):
         with tempfile.TemporaryDirectory(prefix='hermes-clean-package-') as folder:
             work = Path(folder)
-            for name in ('ui', 'backend'):
+            for name in ('ui', 'backend', 'assets'):
                 shutil.copytree(ROOT / name, work / name, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
             for name in ('build-ui.ps1', 'package-dist.ps1', 'providers.json.template', 'user-readme.txt'):
                 if (ROOT / name).exists():
@@ -26,9 +26,11 @@ class CleanPackageTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, output)
             dist = work / 'dist'
             catalog = json.loads((dist / 'providers.json').read_text(encoding='utf-8-sig'))
-            presets = catalog['providers']
-            self.assertEqual([p['id'] for p in presets], ['openrouter', 'custom'])
-            self.assertEqual(presets[0]['endpoint'], 'https://openrouter.ai/api/v1')
+            template = json.loads((ROOT / 'providers.json.template').read_text(encoding='utf-8-sig'))
+            # The shipped catalog must be exactly the repo template -- that is the single
+            # source of truth package-dist.ps1 copies from. A hardcoded preset list here
+            # went stale once (issue #13: it still expected openrouter/custom).
+            self.assertEqual(catalog['providers'], template['providers'])
             self.assertTrue((dist / 'HermesSetup.exe').is_file())
             self.assertTrue((dist / 'backend/worker.ps1').is_file())
             # A novice must get a double-click entry point and instructions in every build.

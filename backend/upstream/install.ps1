@@ -114,19 +114,84 @@ function Invoke-DownloadFromSources {
         [Parameter(Mandatory = $true)][string[]]$Sources,
         [Parameter(Mandatory = $true)][string]$OutFile,
         [string]$Label = 'download',
-        [long]$MinBytes = 0
+        [long]$MinBytes = 0,
+        # Subscriber patch: expected SHA-256 (hex) of the file. A mirror can serve anything, so
+        # when this is set a source whose bytes differ is deleted and the next source is tried;
+        # if none matches, no unverified file is left behind.
+        [string]$Sha256 = ''
     )
+    $script:DownloadHashMismatch = $false
     foreach ($src in $Sources) {
         if ([string]::IsNullOrWhiteSpace($src)) { continue }
         Write-Info ("  {0}: trying {1}" -f $Label, $src)
         if (Invoke-DownloadWithRetry -Uri $src -OutFile $OutFile -Label $Label) {
             $ok = Test-Path -LiteralPath $OutFile
             if ($ok -and $MinBytes -gt 0) { $ok = ((Get-Item -LiteralPath $OutFile).Length -ge $MinBytes) }
+            if ($ok -and $Sha256) {
+                $actual = (Get-FileHash -LiteralPath $OutFile -Algorithm SHA256).Hash
+                if ($actual -ine $Sha256) {
+                    $script:DownloadHashMismatch = $true
+                    Write-Warn ("  {0}: {1} failed the SHA-256 check; discarding it and trying the next source" -f $Label, $src)
+                    Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+                    continue
+                }
+            }
             if ($ok) { return $true }
             Write-Warn ("  {0}: {1} looked incomplete; trying the next source" -f $Label, $src)
         }
     }
+    if ($Sha256) { Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue }
     return $false
+}
+
+# Subscriber patch: verify an extracted Hermes source tree against the manifest built from the
+# pinned commit at package time (backend\upstream\tree-manifest.sha256, tools\tree_manifest.py):
+# path + SHA-256 of every file exactly as the GitHub archive ZIP holds it. The ZIP can arrive
+# through a third-party proxy, so nothing in it may run until every file matches, none is
+# missing and none is extra. Returns $null when the tree matches, otherwise a short reason.
+function Read-HermesTreeManifest {
+    param([string]$Path, [string]$Commit)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Hermes tree manifest unusable: file not found" }
+    $expected = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    $manifestCommit = ''
+    $declared = -1
+    foreach ($line in [IO.File]::ReadAllLines($Path, [Text.Encoding]::UTF8)) {
+        if ($line -match '^# commit ([0-9a-f]{40})$') { $manifestCommit = $Matches[1]; continue }
+        if ($line -match '^# files (\d+)$') { $declared = [int]$Matches[1]; continue }
+        if ($line.StartsWith('#')) { continue }
+        if ($line -notmatch '^([0-9a-f]{64})  (\S.*)$' -or $expected.ContainsKey($Matches[2])) { throw "Hermes tree manifest unusable: malformed line" }
+        $expected[$Matches[2]] = $Matches[1]
+    }
+    if ($manifestCommit -cne $Commit) { throw "Hermes tree manifest unusable: it describes commit '$manifestCommit', not $Commit" }
+    if ($declared -ne $expected.Count -or $declared -lt 1) { throw "Hermes tree manifest unusable: file count does not match its header" }
+    return ,$expected
+}
+
+function Test-HermesTreeManifest {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)]$Expected
+    )
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $matched = 0
+    try {
+        foreach ($file in [IO.Directory]::EnumerateFiles($rootFull, '*', [IO.SearchOption]::AllDirectories)) {
+            $rel = $file.Substring($rootFull.Length).Replace('\', '/')
+            $want = $null
+            if (-not $Expected.TryGetValue($rel, [ref]$want)) { return "unexpected file $rel" }
+            $stream = [IO.File]::OpenRead($file)
+            try { $got = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() } finally { $stream.Dispose() }
+            if ($got -cne $want) { return "content mismatch $rel" }
+            $matched++
+        }
+    } catch {
+        return "verification error: $($_.Exception.Message)"
+    } finally {
+        $sha.Dispose()
+    }
+    if ($matched -ne $Expected.Count) { return ("{0} file(s) missing" -f ($Expected.Count - $matched)) }
+    return $null
 }
 
 # Suppress Invoke-WebRequest's per-chunk progress bar.  Windows PowerShell
@@ -452,6 +517,16 @@ $script:GitForWindowsMirrors = @(
     'https://registry.npmmirror.com/-/binary/git-for-windows/',
     'https://mirrors.huaweicloud.com/git-for-windows/'
 )
+# Subscriber patch: official SHA-256 of each pinned git-for-windows asset, from the release notes
+# of https://github.com/git-for-windows/git/releases/tag/v2.54.0.windows.1 (identical to the
+# GitHub asset digests; fetched 2026-09-24). Every source, direct or mirror, must serve these bytes.
+$script:GitForWindowsSha256 = @{
+    'PortableGit-2.54.0-64-bit.7z.exe' = 'bea006a6cc69673f27b1647e84ab3a68e912fbc175ab6320c5987e012897f311'
+    'PortableGit-2.54.0-arm64.7z.exe'  = 'f8e92cd3359fcbb96998cfd606a536ccc6dbfb23c04e12b29042f9ba45b6b0c7'
+    'MinGit-2.54.0-32-bit.zip'         = '52fc36c9b22611f0a6a7fabdc68c763b914400e3af0e35ad822468dc64cb7981'
+}
+# Subscriber patch: file manifest of the pinned commit, shipped next to this script.
+$script:HermesTreeManifestPath = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'tree-manifest.sha256' } else { $null }
 $PythonVersion = "3.11"
 # Minor versions the installer accepts when the requested $PythonVersion isn't
 # available, in preference order. Only checkout-private uv-managed interpreters
@@ -1624,8 +1699,17 @@ function Install-Git {
         $gitSources = @($downloadUrl)
         foreach ($mirror in $script:GitForWindowsMirrors) { $gitSources += ("$mirror$gitTag/$assetName") }
 
+        # Subscriber patch: the self-extractor is EXECUTED below, so its bytes must be the official ones.
+        $gitSha256 = $script:GitForWindowsSha256[$assetName]
+        if (-not $gitSha256) { throw "No pinned SHA-256 for $assetName" }
+
         Write-Info "Downloading $assetName (Git for Windows $gitVerTag)..."
-        if (-not (Invoke-DownloadFromSources -Sources $gitSources -OutFile $tmpFile -Label $assetName -MinBytes 3000000)) {
+        if (-not (Invoke-DownloadFromSources -Sources $gitSources -OutFile $tmpFile -Label $assetName -MinBytes 3000000 -Sha256 $gitSha256)) {
+            if ($script:DownloadHashMismatch) {
+                # Set as the failure reason so Stage-Git reports it instead of a generic network error.
+                $script:GitInstallFailureReason = "PortableGit SHA-256 mismatch: no source served the official $assetName"
+                throw $script:GitInstallFailureReason
+            }
             throw "PortableGit download failed after retries: $assetName"
         }
 
@@ -2550,22 +2634,79 @@ function Install-Repository {
                     $zipLabel = $Branch
                 }
                 $zipPath = "$env:TEMP\hermes-agent-$zipLabel.zip"
-                $extractPath = "$env:TEMP\hermes-agent-extract"
+                # Subscriber patch: short extraction root. The deepest file of the pinned tree
+                # is 159 chars; under %TEMP% the extracted path reached ~275 > MAX_PATH (260) on
+                # Windows without LongPathsEnabled (the default), so both Expand-Archive and
+                # ZipFile failed and the proxied ZIP route could never succeed (Windows Sandbox,
+                # github.com blocked, 2026-09-24). A drive-root folder keeps it ~228; %TEMP% stays
+                # as the fallback when the drive root is not writable.
+                $extractPath = $null
+                foreach ($candidate in @(("$env:SystemDrive\hx-" + [Guid]::NewGuid().ToString('N').Substring(0, 8)), "$env:TEMP\hermes-agent-extract")) {
+                    try { [void][IO.Directory]::CreateDirectory($candidate); [IO.Directory]::Delete($candidate); $extractPath = $candidate; break } catch { }
+                }
+                if (-not $extractPath) { throw "Repository archive download failed: no writable extraction folder" }
 
                 # Direct GitHub first, then archive proxies for blocked-github networks.
                 $zipSources = @($zipUrl)
                 foreach ($proxy in $script:GitHubZipProxies) { $zipSources += ("$proxy$zipUrl") }
-                if (-not (Invoke-DownloadFromSources -Sources $zipSources -OutFile $zipPath -Label "hermes-agent $zipLabel" -MinBytes 1000000)) {
+
+                # Subscriber patch: a ZIP is accepted only if its extracted tree matches the file
+                # manifest of the pinned commit (Test-HermesTreeManifest). A proxy -- or anything
+                # between us and github.com -- can serve different code; such a source is discarded
+                # and the next one is tried, and nothing from an unverified tree ever runs. Only a
+                # pinned -Commit has a manifest, so the ZIP route requires one.
+                if (-not $Commit) { throw "Hermes tree manifest unusable: the ZIP fallback needs -Commit" }
+                $treeExpected = Read-HermesTreeManifest -Path $script:HermesTreeManifestPath -Commit $Commit
+                $treeMismatch = $false
+                $extractedDir = $null
+                foreach ($zipSource in $zipSources) {
+                    if (-not (Invoke-DownloadFromSources -Sources @($zipSource) -OutFile $zipPath -Label "hermes-agent $zipLabel" -MinBytes 1000000)) { continue }
+                    if (Test-Path $extractPath) { Remove-Item -Recurse -Force $extractPath }
+                    $treeProblem = $null
+                    try {
+                        # Subscriber patch: ZipFile instead of Expand-Archive (PS 5.1 took ~167 s on
+                        # this 80 MB archive), with an explicit zip-slip guard before any write.
+                        Add-Type -AssemblyName System.IO.Compression.FileSystem
+                        $root = [IO.Path]::GetFullPath($extractPath).TrimEnd('\') + '\'
+                        $zipRead = [IO.Compression.ZipFile]::OpenRead($zipPath)
+                        try {
+                            foreach ($entry in $zipRead.Entries) {
+                                $target = [IO.Path]::GetFullPath([IO.Path]::Combine($root, $entry.FullName))
+                                if (-not $target.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw "archive entry escapes the extraction folder: $($entry.FullName)" }
+                            }
+                        } finally { $zipRead.Dispose() }
+                        [IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $extractPath)
+                    } catch {
+                        Write-Warn "  hermes-agent ${zipLabel}: $zipSource did not extract ($($_.Exception.Message)); trying the next source"
+                        Remove-Item -Recurse -Force $extractPath -ErrorAction SilentlyContinue
+                        continue
+                    }
+                    # GitHub ZIPs extract to exactly one repo-<ref>/ directory.
+                    $top = @(Get-ChildItem -LiteralPath $extractPath -Force)
+                    if ($top.Count -ne 1 -or -not $top[0].PSIsContainer) {
+                        $treeProblem = 'unexpected archive layout'
+                    } else {
+                        $treeProblem = Test-HermesTreeManifest -Root $top[0].FullName -Expected $treeExpected
+                    }
+                    if (-not $treeProblem) {
+                        Write-Success "Downloaded code matches the verified file list ($($treeExpected.Count) files)"
+                        $extractedDir = $top[0]
+                        $script:ZipTreeVerified = $true
+                        break
+                    }
+                    $treeMismatch = $true
+                    Write-Warn "  hermes-agent ${zipLabel}: $zipSource does not match the verified file list ($treeProblem); discarding it"
+                    Remove-Item -Force $zipPath -ErrorAction SilentlyContinue
+                    Remove-Item -Recurse -Force $extractPath -ErrorAction SilentlyContinue
+                }
+                if (-not $extractedDir) {
+                    if ($treeMismatch) { throw "Hermes tree manifest mismatch: no source served the pinned code" }
                     throw "Repository archive download failed after retries: $zipLabel"
                 }
-                if (Test-Path $extractPath) { Remove-Item -Recurse -Force $extractPath }
-                Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
-
-                # GitHub ZIPs extract to repo-branch/ subdirectory
-                $extractedDir = Get-ChildItem $extractPath -Directory | Select-Object -First 1
                 if ($extractedDir) {
                     New-Item -ItemType Directory -Force -Path (Split-Path $InstallDir) -ErrorAction SilentlyContinue | Out-Null
                     Move-Item $extractedDir.FullName $InstallDir -Force
+                    Remove-Item -LiteralPath $extractPath -Recurse -Force -ErrorAction SilentlyContinue
                     Write-Success "Downloaded and extracted"
 
                     # Initialize git repo so updates work later. A bare
@@ -2574,7 +2715,14 @@ function Install-Repository {
                     # (#50823 / #61657). Fetch the requested ref and force-check
                     # it out (-f) so untracked ZIP files cannot block checkout.
                     Push-Location $InstallDir
-                    git -c windows.appendAtomically=false init 2>$null
+                    # Subscriber patch: git >= 2.28 prints an "initial branch" hint on stderr and,
+                    # under $ErrorActionPreference='Stop', PS 5.1 turns any native stderr line into
+                    # a terminating error: the verified ZIP route failed right after extraction
+                    # (Windows Sandbox, github.com blocked, 2026-09-24). Relax only for these setup
+                    # calls; restored before the fetch block below.
+                    $prevInitEAP = $ErrorActionPreference
+                    $ErrorActionPreference = 'Continue'
+                    git -c windows.appendAtomically=false -c init.defaultBranch=main init 2>$null
                     git -c windows.appendAtomically=false config windows.appendAtomically false 2>$null
                     # Pin autocrlf=false BEFORE the checkout below. Git for Windows
                     # defaults to core.autocrlf=true, which would renormalize the
@@ -2587,6 +2735,7 @@ function Install-Repository {
                     git -c windows.appendAtomically=false config core.autocrlf false 2>$null
                     git remote add origin $RepoUrlHttps 2>$null
                     $fetchRef = if ($Commit) { $Commit } elseif ($Tag) { "refs/tags/$Tag" } else { $Branch }
+                    $ErrorActionPreference = $prevInitEAP
                     Write-Info "Fetching $fetchRef so the ZIP checkout has a resolvable HEAD..."
                     $prevZipEAP = $ErrorActionPreference
                     $ErrorActionPreference = "Continue"
@@ -2619,11 +2768,12 @@ function Install-Repository {
                     Pop-Location
                     Write-Success "Git repo initialized for future updates"
 
-                    # Subscriber patch: the archive URL is built from $Commit, so this IS
-                    # the pinned snapshot. When github.com is blocked the git fetch above
+                    # Subscriber patch: the tree was verified file by file against the
+                    # pinned commit's manifest above; that check, not this marker, is what
+                    # proves the code. When github.com is blocked the git fetch above
                     # cannot run (no HEAD, no commit for the desktop stamp). Record the
-                    # pin for the worker's revision check and seed GITHUB_SHA so
-                    # write-build-stamp still stamps the build.
+                    # pin (informational, for the worker's revision check) and seed
+                    # GITHUB_SHA so write-build-stamp still stamps the build.
                     if ($Commit) {
                         try { Set-Content -LiteralPath (Join-Path $InstallDir '.hermes-subscriber-pin') -Value $Commit -Encoding ASCII -ErrorAction Stop } catch { }
                         if (-not $env:GITHUB_SHA) { $env:GITHUB_SHA = $Commit }
@@ -2637,6 +2787,9 @@ function Install-Repository {
                 Remove-Item -Recurse -Force $extractPath -ErrorAction SilentlyContinue
             } catch {
                 Write-Err "ZIP download also failed: $_"
+                # Subscriber patch: a failed code verification must surface as itself, never
+                # as the generic "failed to download repository" network error below.
+                if ("$_" -match 'Hermes tree manifest') { throw }
             }
         }
 
@@ -2665,7 +2818,14 @@ function Install-Repository {
         $prevEAP = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         try {
-            if ($Commit) {
+            # Subscriber patch: a ZIP tree already verified file by file against the pinned
+            # commit's manifest IS that commit. Re-pinning via `git fetch` needs github.com,
+            # which is exactly what the ZIP route exists to avoid; it failed with exit 128
+            # right after a successful verification (Windows Sandbox, github.com blocked,
+            # 2026-09-24). The worker then checks the pin via .hermes-subscriber-pin.
+            if ($Commit -and $script:ZipTreeVerified) {
+                Write-Info "Code verified against the pinned commit's file list; skipping the git pin fetch"
+            } elseif ($Commit) {
                 Write-Info "Pinning to commit $Commit..."
                 # Subscriber patch: fetch only the pinned snapshot, not its entire history.
                 # The sandbox/lab network resets long HTTPS bodies (observed: ETIMEDOUT/Early EOF),
@@ -4099,6 +4259,11 @@ $script:DesktopElectronFallbackMirrors = @(
 )
 # Kept for compatibility with call sites that expect a single base URL.
 $script:DesktopElectronFallbackMirror = $script:DesktopElectronFallbackMirrors[0].Mirror
+# Subscriber patch: what makes these mirrors safe is electron's install.js validating the zip
+# against the checksums.json inside the electron package (itself pinned by package-lock
+# sha512 integrity); @electron/get re-validates cache hits too. Either variable below swaps
+# that for a SHASUMS256.txt fetched from the SAME mirror, so it must never reach this process.
+Remove-Item Env:electron_use_remote_checksums, Env:npm_config_electron_use_remote_checksums -ErrorAction SilentlyContinue
 
 function Approve-ElectronInstallScript {
     # Subscriber patch: npm >= 12 refuses to run dependency install scripts unless the project
@@ -4586,6 +4751,28 @@ $electronCacheDir = Join-Path $env:LOCALAPPDATA 'electron\Cache'
                             }
                             if ($try -lt 3) { Start-Sleep -Seconds (3 * $try) }
                         }
+                        # Subscriber patch: github.com blocked. node-pre-gyp fetches the prebuilt
+                        # binary only from GitHub releases (no checksum) and then tries to compile
+                        # from source, which needs Python + a C++ toolchain a normal PC lacks; the
+                        # desktop stage died here (Windows Sandbox, github.com blocked, 2026-09-24).
+                        # Install the package without its scripts and add the binary ourselves,
+                        # downloaded from GitHub or the same proxies and pinned by SHA-256 to the
+                        # official v9.3.0 release asset (x64 only: the release has no arm64 build).
+                        $gwHasVendored = (Test-Path -LiteralPath $gwVendoredBinding) -and
+                            (@(Get-ChildItem -LiteralPath $gwVendoredBinding -Recurse -Filter '*.node' -File -ErrorAction SilentlyContinue).Count -gt 0)
+                        if (-not $gwHasVendored -and [Environment]::Is64BitOperatingSystem -and $env:PROCESSOR_ARCHITECTURE -ne 'ARM64') {
+                            Write-Warn "get-windows prebuilt binary unreachable directly; trying the hash-pinned release asset via mirrors..."
+                            & $npmExe install get-windows@9.3.0 --ignore-scripts --omit=dev --no-audit --no-fund --no-package-lock 2>&1 | Out-Null
+                            $gwAsset = 'https://github.com/sindresorhus/get-windows/releases/download/v9.3.0/napi-9-win32-unknown-x64.tar.gz'
+                            $gwSources = @($gwAsset)
+                            foreach ($proxy in $script:GitHubZipProxies) { $gwSources += ("$proxy$gwAsset") }
+                            $gwTgz = Join-Path $gwVendor 'get-windows-binary.tar.gz'
+                            if ((Test-Path -LiteralPath $gwVendoredPkg) -and
+                                (Invoke-DownloadFromSources -Sources $gwSources -OutFile $gwTgz -Label 'get-windows binary' -MinBytes 10000 -Sha256 '3eecfad06ed44f379bc50e02d738fa5dde274ce0206ced4c58b8f776ec9d76b0')) {
+                                New-Item -ItemType Directory -Force -Path $gwVendoredBinding | Out-Null
+                                & "$env:SystemRoot\System32\tar.exe" -xzf $gwTgz -C $gwVendoredBinding 2>&1 | Out-Null
+                            }
+                        }
                     } finally {
                         Pop-Location
                     }
@@ -4707,6 +4894,10 @@ $electronCacheDir = Join-Path $env:LOCALAPPDATA 'electron\Cache'
                 if (-not (Test-ElectronDist -InstallDir $InstallDir)) {
                     Restore-ElectronDist -InstallDir $InstallDir -Mirror $cand.Mirror -CustomDir $cand.CustomDir | Out-Null
                 }
+                # Subscriber patch: pack against a mirror only with a local dist (checksum-verified
+                # by electron's install.js). Without one, electron-builder downloads Electron itself
+                # with no pinned checksum and checks it against SHASUMS256.txt from the same mirror.
+                if (-not (Test-ElectronDist -InstallDir $InstallDir)) { continue }
                 $prevMirror = Set-ElectronMirrorEnv -Candidate $cand
                 try {
                     & $npmExe run pack 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $buildLog

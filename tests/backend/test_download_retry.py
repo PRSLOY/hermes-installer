@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 
 INSTALL_PS1 = Path(__file__).resolve().parents[2] / 'backend' / 'upstream' / 'install.ps1'
+WORKER_PS1 = Path(__file__).resolve().parents[2] / 'backend' / 'worker.ps1'
 
 
 class DownloadRetryTests(unittest.TestCase):
@@ -56,43 +57,45 @@ class DownloadRetryTests(unittest.TestCase):
 
     def test_repo_archive_download_is_retried(self):
         i = self.src.index('$zipPath = "$env:TEMP\\hermes-agent-$zipLabel.zip"')
-        block = self.src[i:i + 900]
+        # Wider window: the per-source tree verification comment now precedes the call.
+        block = self.src[i:i + 2600]
         # Retried per source (direct GitHub then archive proxies).
         self.assertIn('Invoke-DownloadFromSources', block,
                       'the fallback repo ZIP download must retry as well')
 
     def test_no_bare_large_download_remains(self):
-        """Any remaining bare Invoke-WebRequest -OutFile would reintroduce the single-shot bug.
+        """Any bare Invoke-WebRequest -OutFile would reintroduce the single-shot bug.
 
-        The retry helper's own inner call is the one legitimate occurrence, so the check
-        ignores everything inside `function Invoke-DownloadWithRetry { ... }`.
+        The match is order-insensitive: a flag placed before -Uri (as in worker.ps1's VC
+        redist) must not evade it. Two calls are legitimate and are skipped explicitly:
+          - the retry helper's own inner request (install.ps1), and
+          - the Microsoft-signed VC++ redist in worker.ps1, which is retried and
+            Authenticode-verified before it runs.
         """
-        start = self.src.index('function Invoke-DownloadWithRetry')
-        depth = 0
-        end = len(self.src)
-        for i in range(start, len(self.src)):
-            ch = self.src[i]
-            if ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-        helper = self.src[start:end]
+        src = INSTALL_PS1.read_text(encoding='utf-8-sig')
+        lines = src.splitlines()
+        helper_start = next(i for i, l in enumerate(lines, 1)
+                            if l.startswith('function Invoke-DownloadWithRetry'))
+        helper_end = next(i for i in range(helper_start, len(lines) + 1) if lines[i - 1] == '}')
 
         offenders = []
-        for n, line in enumerate(self.src.splitlines(), 1):
-            s = line.strip()
-            if s.startswith('Invoke-WebRequest -Uri') and '-OutFile' in s:
-                offenders.append((n, s))
-        # Only the helper's internal call may remain.
-        self.assertEqual(
-            len(offenders), 1,
-            f'bare single-shot downloads remain at {offenders}; route them through '
-            f'Invoke-DownloadWithRetry')
-        self.assertIn('Invoke-WebRequest -Uri $Uri -OutFile $OutFile', helper,
-                      'the single remaining bare download must be the retry helper itself')
+        for path in (INSTALL_PS1, WORKER_PS1):
+            for n, line in enumerate(path.read_text(encoding='utf-8-sig').splitlines(), 1):
+                s = line.strip()
+                if not (s.startswith('Invoke-WebRequest') and '-OutFile' in s and '-Uri' in s):
+                    continue
+                if path is INSTALL_PS1 and helper_start <= n <= helper_end:
+                    continue
+                if 'VcRedistUrl' in s:
+                    continue
+                offenders.append(f'{path.name}:{n}: {s}')
+
+        self.assertEqual(offenders, [],
+                         f'bare single-shot downloads remain: {offenders}; route them through '
+                         f'a retry helper')
+        # The helper's inner call must still be the one that actually retries.
+        self.assertIn('Invoke-WebRequest -Uri $Uri -OutFile $OutFile', src,
+                      'the retry helper must contain the single inner request')
 
 
 if __name__ == '__main__':

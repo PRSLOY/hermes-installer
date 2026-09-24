@@ -64,7 +64,7 @@ class WorkerFallbackTests(unittest.TestCase):
     def test_invalid_entries_are_rejected(self):
         bad = [
             'not-a-list',
-            [fb(), fb('b', 'https://b.example/v1'), fb('c', 'https://c.example/v1')],   # more than two
+            [fb(), fb('b', 'https://b.example/v1'), fb('c', 'https://c.example/v1'), fb('d', 'https://d.example/v1')],   # more than three
             [fb(), fb('dahl', 'https://other.example/v1')],                             # same provider twice
             [fb(), fb('other', 'https://DAHL.example/v1/')],                            # same endpoint twice
             [fb('p', PRIMARY + '/')],                                                    # the primary itself

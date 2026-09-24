@@ -102,7 +102,10 @@ class ResumeTests(unittest.TestCase):
             self.assertNotIn(b'resume-fake-secret',(root/'hermes.subscriber-checkpoint.json').read_bytes())
 
     def test_changed_partial_and_invalid_marker_refuse(self):
-        for mode in ['changed','added','corrupt','foreign','config','env','completed','pin','bad-snapshot']:
+        # 'changed', 'added' and 'completed' used to refuse too. An interrupted tree is now parked
+        # aside untouched and reinstalled (test_changed_interrupted_tree_is_parked_and_reinstalled);
+        # foreign settings/keys, a forged or foreign journal and a wrong pin still refuse.
+        for mode in ['corrupt','foreign','config','env','pin','bad-snapshot']:
             with self.subTest(mode=mode),tempfile.TemporaryDirectory(prefix='subscriber-resume-negative-') as tmp:
                 root=Path(tmp); self.interrupted(root)
                 marker=root/'hermes.subscriber-checkpoint.json'
@@ -123,5 +126,19 @@ class ResumeTests(unittest.TestCase):
                 self.assertEqual(json.loads(out.splitlines()[-1])['code'],'CONFIG')
                 self.assertEqual(len((root/'pins.txt').read_text().splitlines()),1)
                 self.assertEqual(before,{str(f.relative_to(root/'hermes')):f.read_bytes() for f in (root/'hermes').rglob('*') if f.is_file()})
+
+    def test_changed_interrupted_tree_is_parked_and_reinstalled(self):
+        """After Cancel the tree differs from the lagging checkpoint: park it, install clean."""
+        for mode in ['changed','added','completed']:
+            with self.subTest(mode=mode),tempfile.TemporaryDirectory(prefix='subscriber-resume-park-') as tmp:
+                root=Path(tmp); self.interrupted(root)
+                target={'changed':'hermes-agent/partial.txt','added':'user.txt','completed':'hermes-agent/.hermes-bootstrap-complete'}[mode]
+                (root/'hermes'/target).write_text('INTERRUPTED STATE')
+                p=self.start(root,'complete'); out,err=p.communicate(timeout=30)
+                self.assertEqual(p.returncode,0,(out,err))
+                self.assertEqual(len((root/'pins.txt').read_text().splitlines()),2)
+                parked=[d for d in root.iterdir() if d.name.startswith('hermes.subscriber-preserved-')]
+                self.assertEqual(len(parked),1)
+                self.assertEqual((parked[0]/target).read_text(),'INTERRUPTED STATE')
 
 if __name__=='__main__': unittest.main(verbosity=2)

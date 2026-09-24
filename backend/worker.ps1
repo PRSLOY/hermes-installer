@@ -79,6 +79,12 @@ function Check-InstallResult($Result) {
         # cause instead of "check free disk space" for what is usually a network failure.
         $advice = ''
         $r = $reason.ToLowerInvariant()
+        # Integrity failures are not network trouble: "retry / check VPN" would be the wrong advice.
+        $integrity = ''
+        if ($r -match 'hermes tree manifest mismatch') { $integrity = 'Скачанный код Hermes не совпал с проверенной версией. Установка остановлена.' }
+        elseif ($r -match 'hermes tree manifest unusable') { $integrity = 'Пакет установщика повреждён: нет списка проверенных файлов Hermes. Скачайте пакет заново.' }
+        elseif ($r -match 'portablegit sha-256 mismatch') { $integrity = 'Скачанный Git не совпал с официальной версией. Установка остановлена.' }
+        if ($integrity) { Fail 'INSTALL' $integrity }
         # Stage-specific cause first: a concrete sentence per known stage beats guessing
         # from a generic reason, so a novice never reads "check free disk space".
         $stageAdvice = @{
@@ -161,10 +167,19 @@ function Install-VcRuntime([string]$SystemDir = (Join-Path $env:WINDIR 'System32
     try {
         [void][IO.Directory]::CreateDirectory($dir)
         $file = Join-Path $dir 'vc_redist.x64.exe'
-        try {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -UseBasicParsing -Uri $script:VcRedistUrl -OutFile $file -TimeoutSec 180
-        } catch { return 'network' }
+        # Retry: the redist is ~25 MB and one dropped connection would otherwise fail the
+        # optional voice component. The file is Authenticode-checked below before it runs.
+        $downloaded = $false
+        for ($attempt = 1; $attempt -le 3 -and -not $downloaded; $attempt++) {
+            try {
+                [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                Invoke-WebRequest -UseBasicParsing -Uri $script:VcRedistUrl -OutFile $file -TimeoutSec 180
+                $downloaded = $true
+            } catch {
+                if ($attempt -lt 3) { Start-Sleep -Seconds (5 * $attempt) }
+            }
+        }
+        if (-not $downloaded) { return 'network' }
         $size = (Get-Item -LiteralPath $file).Length
         if ($size -lt 5MB -or $size -gt 100MB) { return 'signature' }
         if (-not (Test-MicrosoftSignature (Get-AuthenticodeSignature -LiteralPath $file))) { return 'signature' }
@@ -235,7 +250,7 @@ function Invoke-TelegramAction([string]$Action, $InputData, [string]$HomeDir, [s
 function Get-FallbackEntries($InputData) {
     $value = $InputData.fallbacks
     if ($null -eq $value) { return }
-    if ($value -isnot [array] -or $value.Count -gt 2) { throw 'fallbacks' }
+    if ($value -isnot [array] -or $value.Count -gt 3) { throw 'fallbacks' }
     $seenIds = @()
     $seenEndpoints = @(([string]$InputData.endpoint).TrimEnd('/').ToLowerInvariant())
     foreach ($fb in $value) {
@@ -336,6 +351,11 @@ function Main {
             $installer = Join-Path $PSScriptRoot 'upstream\install.ps1'
             $expected = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'upstream\install.sha256') -Raw).Trim()
             if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash -ine $expected) { Fail 'INSTALL' 'Контрольная сумма официального установщика не совпала. Скачайте пакет заново.' }
+            # install.ps1 verifies a proxied repository ZIP against this manifest; a package without
+            # the manifest for exactly this pin must not start (it would fail late, mid-install).
+            $treeManifest = Join-Path $PSScriptRoot 'upstream\tree-manifest.sha256'
+            $manifestHead = if (Test-Path -LiteralPath $treeManifest -PathType Leaf) { @(Get-Content -LiteralPath $treeManifest -TotalCount 5) } else { @() }
+            if ($manifestHead -notcontains "# commit $pin") { Fail 'INSTALL' 'Пакет установщика повреждён: нет списка проверенных файлов Hermes. Скачайте пакет заново.' }
             $script:InstallState=$state; $script:InstallInitialHash=Install-TreeHash $homeDir
             $result = Run-Child "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$installer,'-NonInteractive','-SkipSetup','-IncludeDesktop','-Json','-Commit',$pin,'-HermesHome',$homeDir,'-InstallDir',$repo) '' 2400 -StreamStages
             Check-InstallResult $result
@@ -345,7 +365,9 @@ function Main {
             if (-not (Test-Path -LiteralPath $exe -PathType Leaf) -or -not (Test-Path -LiteralPath $python -PathType Leaf)) { Fail 'INSTALL' 'Не найден рабочий Hermes или Python.' }
             # Revision pin. A real git clone leaves HEAD detached at the pinned commit.
             # A github-blocked install reaches the same pinned archive through a proxy
-            # and records the pin in a marker file instead (install.ps1 ZIP path).
+            # and records the pin in a marker file instead (install.ps1 ZIP path). The marker
+            # is informational: install.ps1 writes it only after the extracted tree matched
+            # tree-manifest.sha256 file by file, and that check is what proves the code.
             $headPin = ''
             try { $h = Join-Path $repo '.git\HEAD'; if (Test-Path -LiteralPath $h) { $headPin = (Get-Content -LiteralPath $h -Raw).Trim() } } catch { }
             $markerPin = ''
@@ -356,6 +378,15 @@ function Main {
         } else {
             $state=Read-Journal $homeDir $repo $pin $sid
             if ($state.phase -eq 'installing') { Fail 'CONFIG' 'Незавершённая установка сохранена. Безопасное автоматическое восстановление пока недоступно; обратитесь в поддержку. Файлы не удалены.' }
+            # 'configuring' left behind = the key check was interrupted (Cancel, closed
+            # window, crash). We hold the per-user installer mutex, so that run is gone.
+            # configure.py writes .env/config.yaml only at the very end, atomically with
+            # rollback, and its own conflict checks still refuse foreign settings; going
+            # back one step is safe and turns a permanent refusal into a normal retry.
+            if ($state.phase -eq 'configuring') {
+                $state.phase='awaiting_api'; Write-Journal $state
+                Send-Event @{type='progress';message='Прошлая проверка ключа была прервана. Проверяю заново.'}
+            }
             if ($state.phase -ne 'awaiting_api') { Fail 'CONFIG' 'Настройка уже завершена или прервана во время записи. Автоматическая перезапись запрещена.' }
             Assert-JournalSnapshot $state
             $desktopExe = Check-Desktop $repo
@@ -438,7 +469,7 @@ function Main {
                 $script:ChildLabel = 'Запасные провайдеры'
                 $fbInput = @{fallbacks=[object[]]$fallbackEntries} | ConvertTo-Json -Compress -Depth 6
                 # Up to 2 live checks of 3 x 45 s transport attempts each, plus the writes.
-                $fb = Run-Child $python @((Join-Path $PSScriptRoot 'fallbacks.py'),$homeDir) $fbInput 420
+                $fb = Run-Child $python @((Join-Path $PSScriptRoot 'fallbacks.py'),$homeDir) $fbInput 600
                 $fbLast = @($fb.Text -split "`n" | Where-Object { $_.Trim() })[-1]
                 $fbResults = @(($fbLast | ConvertFrom-Json).results)
                 for ($i = 0; $i -lt $fbTotal -and $i -lt $fbResults.Count; $i++) {

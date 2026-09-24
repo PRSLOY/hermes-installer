@@ -20,7 +20,7 @@ foreach ($name in @('worker.ps1','streaming.ps1','checkpoint.ps1','protect.ps1',
     Copy-Item -LiteralPath (Join-Path $root "backend\$name") (Join-Path $dist "backend\$name") -Force
 }
 [void][IO.Directory]::CreateDirectory((Join-Path $dist 'backend\upstream'))
-foreach ($name in @('install.ps1','install.sha256','commit.txt')) {
+foreach ($name in @('install.ps1','install.sha256','commit.txt','tree-manifest.sha256')) {
     Copy-Item -LiteralPath (Join-Path $root "backend\upstream\$name") (Join-Path $dist "backend\upstream\$name")
 }
 # cli-config.yaml.example is the pristine template configure.py may replace on fresh installs.
@@ -32,9 +32,10 @@ if (Test-Path -LiteralPath $assetsDist) { Remove-Item -LiteralPath $assetsDist -
 [void][IO.Directory]::CreateDirectory($assetsDist)
 Copy-Item -LiteralPath (Join-Path $root 'assets\SOUL.md') (Join-Path $assetsDist 'SOUL.md') -Force
 Copy-Item -LiteralPath (Join-Path $root 'assets\skills') (Join-Path $assetsDist 'skills') -Recurse -Force
-# Marketplaces MCP launcher + Wildberries server: the .py files only (never a __pycache__ left by tests).
+# Marketplaces MCP launcher + Wildberries server: the .py files only (never a __pycache__ left by tests),
+# plus the file manifest extras.py verifies the downloaded ru-marketplace-mcp tree against.
 [void][IO.Directory]::CreateDirectory((Join-Path $assetsDist 'marketplaces'))
-foreach ($name in @('direct_launcher.py','direct_common.py','direct_proxy.py','wb_browser_mcp.py')) {
+foreach ($name in @('direct_launcher.py','direct_common.py','direct_proxy.py','wb_browser_mcp.py','tree-manifest.sha256')) {
     Copy-Item -LiteralPath (Join-Path $root "assets\marketplaces\$name") (Join-Path $assetsDist "marketplaces\$name") -Force
 }
 
@@ -91,6 +92,32 @@ try {
     if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
     if ($status -eq 404) { throw "Pinned commit $pin has no cli-config.yaml.example (HTTP 404): wrong pin in backend\upstream\commit.txt." }
     Write-Warning "template/pin sync NOT verified (network): $($_.Exception.Message)"
+}
+
+# 4c. Tree manifests: install.ps1 (Hermes) and extras.py (ru-marketplace-mcp) accept a (possibly
+# proxied) source ZIP only if every file matches the shipped manifest. Each must name its pin
+# (offline, mandatory) and equal a fresh build from github.com at that pin
+# (tools\tree_manifest.py; exit 3 = no network).
+$extrasText = Get-Content -LiteralPath (Join-Path $root 'backend\extras.py') -Raw
+if ($extrasText -notmatch "MARKETPLACES_COMMIT = '([0-9a-f]{40})'") { throw 'MARKETPLACES_COMMIT not found in backend\extras.py' }
+$mpPin = $Matches[1]
+$mpRepo = 'https://github.com/Vladimir-Human/ru-marketplace-mcp.git'
+$manifests = @(
+    @{ Path = 'backend\upstream\tree-manifest.sha256'; Pin = $pin; Extra = '' },
+    @{ Path = 'assets\marketplaces\tree-manifest.sha256'; Pin = $mpPin
+       Extra = " --repo-url $mpRepo --title `"ru-marketplace-mcp tree manifest`" --zip-url https://codeload.github.com/Vladimir-Human/ru-marketplace-mcp/zip/$mpPin" }
+)
+$tool = Join-Path $root 'tools\tree_manifest.py'
+foreach ($m in $manifests) {
+    $file = Join-Path $root $m.Path
+    $regen = "py -3 tools\tree_manifest.py generate --commit $($m.Pin) --out $($m.Path) --cross-check-zip$($m.Extra)"
+    if (@(Get-Content -LiteralPath $file -TotalCount 5) -notcontains "# commit $($m.Pin)") { throw "$($m.Path) does not describe pinned commit $($m.Pin). Run: $regen" }
+    if (-not (Test-Path -LiteralPath $tool)) { Write-Warning "$($m.Path) NOT re-verified: tools\tree_manifest.py absent"; continue }
+    $checkArgs = @('check', '--commit', $m.Pin, '--manifest', $file)
+    if ($m.Extra) { $checkArgs += @('--repo-url', $mpRepo, '--title', 'ru-marketplace-mcp tree manifest') }
+    & py -3 $tool @checkArgs
+    if ($LASTEXITCODE -eq 3) { Write-Warning "$($m.Path) NOT re-verified against github.com (network)" }
+    elseif ($LASTEXITCODE -ne 0) { throw "$($m.Path) does not match pinned commit $($m.Pin). Run: $regen" }
 }
 Get-ChildItem -LiteralPath $dist -Recurse -File | ForEach-Object { $_.IsReadOnly = $false }
 
