@@ -161,10 +161,19 @@ function Install-VcRuntime([string]$SystemDir = (Join-Path $env:WINDIR 'System32
     try {
         [void][IO.Directory]::CreateDirectory($dir)
         $file = Join-Path $dir 'vc_redist.x64.exe'
-        try {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -UseBasicParsing -Uri $script:VcRedistUrl -OutFile $file -TimeoutSec 180
-        } catch { return 'network' }
+        # Retry: the redist is ~25 MB and one dropped connection would otherwise fail the
+        # optional voice component. The file is Authenticode-checked below before it runs.
+        $downloaded = $false
+        for ($attempt = 1; $attempt -le 3 -and -not $downloaded; $attempt++) {
+            try {
+                [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                Invoke-WebRequest -UseBasicParsing -Uri $script:VcRedistUrl -OutFile $file -TimeoutSec 180
+                $downloaded = $true
+            } catch {
+                if ($attempt -lt 3) { Start-Sleep -Seconds (5 * $attempt) }
+            }
+        }
+        if (-not $downloaded) { return 'network' }
         $size = (Get-Item -LiteralPath $file).Length
         if ($size -lt 5MB -or $size -gt 100MB) { return 'signature' }
         if (-not (Test-MicrosoftSignature (Get-AuthenticodeSignature -LiteralPath $file))) { return 'signature' }

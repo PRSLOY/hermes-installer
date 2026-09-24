@@ -24,11 +24,30 @@ So two things must hold:
   2. The get-windows repair must run even when the install exited non-zero but Electron was
      self-healed, since a failed *optional* dependency leaves npm reporting a broken tree.
 """
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
 INSTALL_PS1 = Path(__file__).resolve().parents[2] / 'backend' / 'upstream' / 'install.ps1'
+PS = str(Path(os.environ['SYSTEMROOT']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+
+
+def _extract_function(src, name):
+    i = src.index('function ' + name)
+    nxt = src.find('\nfunction ', i + 1)
+    return src[i:nxt] if nxt != -1 else src[i:]
+
+
+def _run_ps(script_text):
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / 'run.ps1'
+        p.write_text(script_text, encoding='utf-8-sig')
+        return subprocess.run(
+            [PS, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(p)],
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60)
 
 
 class DesktopInstallResilienceTests(unittest.TestCase):
@@ -70,13 +89,20 @@ class DesktopInstallResilienceTests(unittest.TestCase):
         `AggregateError [ETIMEDOUT]` against github.com while the candidate mirror answered in
         ~2s at ~2.8 MB/s. A mirror that only wrapped the retry never helped the attempt that
         mattered, because the first `npm ci` already fetched (and failed) the payload.
+
+        The search is scoped to the enclosing function: a plain rindex finds an unrelated
+        `Set-ElectronMirrorEnv` inside the Electron repair helper, so deleting the real setup
+        went unnoticed (issue #14).
         """
         first = self.src.index('& $npmExe ci --include=optional')
-        set_idx = self.src.rindex('Set-ElectronMirrorEnv', 0, first)
-        self.assertGreater(set_idx, -1,
-                           'nothing sets the Electron mirror before the first `npm ci`, so the '
-                           'payload download still goes straight to a possibly-blocked github.com')
-        self.assertLess(set_idx, first)
+        func_start = self.src.rfind('\nfunction ', 0, first)
+        self.assertGreater(func_start, -1)
+        between = self.src[func_start:first]
+        self.assertIn('Set-ElectronMirrorEnv -Candidate $script:DesktopElectronFallbackMirrors',
+                      between,
+                      'nothing sets the Electron mirror in the same function before the first '
+                      '`npm ci`, so the payload download still goes straight to a possibly-blocked '
+                      'github.com')
 
     def test_github_remains_the_last_resort(self):
         """A mirror outage must not be able to block installation outright."""
@@ -133,6 +159,36 @@ class DesktopInstallResilienceTests(unittest.TestCase):
         """Guard against accidentally deleting the verified repair implementation."""
         self.assertIn('hermes-getwin-', self.src)
         self.assertIn('apps\\desktop\\node_modules\\get-windows', self.src)
+
+
+class ElectronMirrorEnvExecutesTests(unittest.TestCase):
+    """Run the real Set-/Restore-ElectronMirrorEnv helpers from install.ps1.
+
+    Grepping for 'ELECTRON_MIRROR' only proves the string is present; executing the helper
+    proves it actually exports the variable @electron/get reads and restores it afterwards
+    (issue #14). This is the executable style of test_pin_fetch.py.
+    """
+    @classmethod
+    def setUpClass(cls):
+        cls.src = INSTALL_PS1.read_text(encoding='utf-8-sig')
+        cls.set_fn = _extract_function(cls.src, 'Set-ElectronMirrorEnv')
+        cls.restore_fn = _extract_function(cls.src, 'Restore-ElectronMirrorEnv')
+
+    def test_helper_exports_and_restores_the_mirror(self):
+        script = (
+            self.set_fn + '\n' + self.restore_fn + '\n'
+            "Remove-Item Env:ELECTRON_MIRROR -ErrorAction SilentlyContinue\n"
+            "Remove-Item Env:ELECTRON_CUSTOM_DIR -ErrorAction SilentlyContinue\n"
+            "$prev = Set-ElectronMirrorEnv -Candidate @{ Mirror = 'https://m.example/e/'; CustomDir = '{{ version }}' }\n"
+            'Write-Output ("SET=" + $env:ELECTRON_MIRROR + "|" + $env:ELECTRON_CUSTOM_DIR)\n'
+            'Restore-ElectronMirrorEnv -Prev $prev\n'
+            'Write-Output ("RESTORED=" + $env:ELECTRON_MIRROR + "|" + $env:ELECTRON_CUSTOM_DIR)\n')
+        r = _run_ps(script)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('SET=https://m.example/e/|{{ version }}', r.stdout,
+                      '@electron/get reads ELECTRON_MIRROR/ELECTRON_CUSTOM_DIR; the helper must set both')
+        self.assertIn('RESTORED=|', r.stdout,
+                      'the mirror must be restored so it does not leak into later stages')
 
 
 if __name__ == '__main__':
