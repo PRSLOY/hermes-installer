@@ -73,6 +73,11 @@ namespace HermesSetup
         readonly Panel logHost = new Panel { Name = "LogHost", Dock = DockStyle.Top, Height = 180, MinimumSize = new Size(0, 180), Visible = false };
         readonly RoundedButton details = new RoundedButton { Name = "Details", Text = "Подробности ▸", Primary = false, Width = 140, Height = 32, Font = UiTheme.Font(9.5f), Anchor = AnchorStyles.Left };
         readonly RoundedButton action = new RoundedButton { Name = "Action", Text = "Повторить", Primary = true, Width = 190, Height = 40, Font = UiTheme.Font(10.5F, FontStyle.Bold), Visible = false, Anchor = AnchorStyles.Left };
+        // Always shown on the error screen: a way off the dead end without restarting the
+        // wizard (issue #12). Returns to provider selection.
+        readonly RoundedButton action2 = new RoundedButton { Name = "Action2", Text = "Сменить провайдера", Primary = false, Width = 190, Height = 40, Font = UiTheme.Font(10.5F), Visible = false, Anchor = AnchorStyles.Left };
+        // Visible only while an install is running (issue #11).
+        readonly RoundedButton cancel = new RoundedButton { Name = "Cancel", Text = "Отмена", Primary = false, Width = 120, Height = 36, Font = UiTheme.Font(10F), Visible = false };
         readonly ProgressBar bar = new ProgressBar { Name = "Bar", Dock = DockStyle.Top, Height = 8, Style = ProgressBarStyle.Continuous, Maximum = 100 };
         readonly Label elapsed = new Label { AutoSize = true, ForeColor = UiTheme.Muted, Margin = new Padding(0, 2, 0, 2) };
         readonly Label stageStep = new Label { Name = "StageStep", Text = "", AutoSize = true, ForeColor = UiTheme.Muted, Font = UiTheme.Font(8.5f), Anchor = AnchorStyles.Right, Margin = new Padding(0, 2, 0, 2) };
@@ -92,12 +97,17 @@ namespace HermesSetup
         int selected = 0;
         bool catalogValid = true;
         bool running;
+        bool changeProviderOffered;
         bool modelVisible;
         bool keyShown;
         bool manualEndpointShown;
         DateTime started;
         DateTime lastProgress;
         Outcome result;
+        // Cancellation of the running install (issue #11).
+        CancellationTokenSource cts;
+        bool cancelRequested;
+        bool closeAfterCancel;
 
         public int PageIndex { get; private set; }
         public bool IsRunning { get { return running; } }
@@ -109,6 +119,9 @@ namespace HermesSetup
         // Reflects the wizard's intent independently of whether the window is shown
         // (Control.Visible returns effective visibility, false while the form is hidden).
         public bool ManualEndpointShown { get { return manualEndpointShown; } }
+        // True after an error is shown: the wizard always offers changing the provider,
+        // independent of the window's effective visibility (offline tests read this).
+        public bool ChangeProviderOffered { get { return changeProviderOffered; } }
         public void ToggleModelField()
         {
             modelVisible = !modelVisible;
@@ -244,9 +257,12 @@ namespace HermesSetup
             Back.Anchor = AnchorStyles.Left; Back.Margin = new Padding(0, 0, 8, 0);
             Next.Anchor = AnchorStyles.Right; Next.Margin = new Padding(8, 0, 0, 0);
             Launch.Anchor = AnchorStyles.Right; Launch.Margin = new Padding(8, 0, 0, 0);
+            cancel.Anchor = AnchorStyles.Left; cancel.Margin = new Padding(8, 0, 0, 0);
             footer.Controls.Add(Back, 0, 0);
+            footer.Controls.Add(cancel, 1, 0);
             footer.Controls.Add(Next, 2, 0);
             footer.Controls.Add(Launch, 3, 0);
+            cancel.Click += delegate { ConfirmCancel(); };
             Back.Click += delegate { if (PageIndex == PageKey) GoTo(PageChoose); };
             Next.Click += delegate { OnNext(); };
             Launch.Click += delegate
@@ -271,7 +287,15 @@ namespace HermesSetup
             };
             FormClosing += delegate(object sender, FormClosingEventArgs e)
             {
-                if (running) { e.Cancel = true; MessageBox.Show(this, "Установка ещё выполняется. Закрытие сейчас может оставить незавершённые изменения. Дождитесь результата; окно остаётся доступным.", "Установка продолжается", MessageBoxButtons.OK, MessageBoxIcon.Information); }
+                if (!running) return;
+                e.Cancel = true;   // never close under a live worker
+                if (e.CloseReason != CloseReason.UserClosing) return;
+                // Offer a way out instead of a hard block (issue #11): cancel, then close.
+                if (MessageBox.Show(this, "Установка ещё идёт. Остановить её и закрыть окно?", "Установка продолжается", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                {
+                    closeAfterCancel = true;
+                    RequestCancel();
+                }
             };
             FormClosed += delegate { timer.Dispose(); ApiKey.Clear(); TelegramToken.Clear(); ClearBackups(); };
 
@@ -465,7 +489,11 @@ namespace HermesSetup
             root.Controls.Add(progressNote, 0, 4);
             root.Controls.Add(silence, 0, 5);
             root.Controls.Add(details, 0, 6);
-            root.Controls.Add(action, 0, 7);
+            var actionRow = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = true, BackColor = UiTheme.Background, Margin = Padding.Empty };
+            action.Margin = new Padding(0, 0, 8, 0);
+            actionRow.Controls.Add(action);
+            actionRow.Controls.Add(action2);
+            root.Controls.Add(actionRow, 0, 7);
             root.Controls.Add(statusHint, 0, 8);
             logHost.Controls.Clear();
             logHost.Controls.Add(Log);
@@ -478,8 +506,13 @@ namespace HermesSetup
             };
             action.Click += delegate
             {
-                if (action.Text == "Изменить ключ") { action.Visible = false; statusHint.Visible = true; GoTo(PageKey); ApiKey.Focus(); }
-                else { action.Visible = false; StartInstall(); }
+                if (action.Text == "Изменить ключ") { action.Visible = false; action2.Visible = false; statusHint.Visible = true; GoTo(PageKey); ApiKey.Focus(); }
+                else { action.Visible = false; action2.Visible = false; StartInstall(); }
+            };
+            action2.Click += delegate
+            {
+                action.Visible = false; action2.Visible = false; statusHint.Visible = true;
+                GoTo(PageChoose);
             };
             page.Controls.Add(root);
             return page;
@@ -641,6 +674,8 @@ namespace HermesSetup
             Launch.Enabled = !running && result != null && result.Success;
             Next.Text = PageIndex == PageChoose ? "Далее" : "Установить";
             Next.Enabled = !running && catalogValid && (PageIndex == PageChoose ? CanChoose : true);
+            cancel.Visible = running && PageIndex == PageInstall;
+            cancel.Enabled = running;
         }
 
         void OnNext()
@@ -660,7 +695,7 @@ namespace HermesSetup
             var request = BuildRequest();
             string validation = request.Validate();
             if (validation != null) { KeyError.Text = validation; GoTo(PageKey); return; }
-            running = true; result = null; KeyError.Text = ""; action.Visible = false; statusHint.Visible = false;
+            running = true; result = null; KeyError.Text = ""; action.Visible = false; action2.Visible = false; statusHint.Visible = false; cancelRequested = false; changeProviderOffered = false;
             GoTo(PageInstall);
             Next.Enabled = false; Back.Visible = false;
             Status.ForeColor = UiTheme.Text;
@@ -676,11 +711,22 @@ namespace HermesSetup
         async void RunWorker(Request request)
         {
             bool telegramRequested = !String.IsNullOrEmpty(request.telegram_bot_token);
+            cts = new CancellationTokenSource();
             try
             {
                 result = await WorkerClient.RunAsync(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "backend", "worker.ps1"), request,
                     delegate(string message) { if (!IsDisposed) BeginInvoke((Action)delegate { OnProgress(message); }); },
-                    delegate(int index, int total, string stage) { if (!IsDisposed) BeginInvoke((Action)delegate { OnStage(index, total, stage); }); });
+                    delegate(int index, int total, string stage) { if (!IsDisposed) BeginInvoke((Action)delegate { OnStage(index, total, stage); }); },
+                    cts.Token);
+                if (IsDisposed) return;
+                if (cancelRequested)
+                {
+                    Status.ForeColor = UiTheme.Muted;
+                    Status.Text = "Установка отменена. Можно повторить, изменить ключ или сменить провайдера.";
+                    LogAppend("Установка отменена пользователем.");
+                    ShowErrorAction(null);
+                    return;
+                }
                 Status.Text = result.Message;
                 Status.ForeColor = result.Success ? UiTheme.Success : UiTheme.Error;
                 LogAppend(result.Success ? "Установка подтверждена." : "Ошибка: " + result.Message);
@@ -694,23 +740,48 @@ namespace HermesSetup
                     if (connected) ShowTelegramStep(result.TelegramBot);
                     GoTo(PageDone);
                 }
-                else ShowErrorAction(result.Message);
+                else ShowErrorAction(result);
             }
             catch
             {
+                if (IsDisposed) return;
                 Status.ForeColor = UiTheme.Error;
                 Status.Text = "Не удалось завершить проверку. Обратитесь в поддержку; установка не подтверждена.";
                 LogAppend(Status.Text);
-                ShowErrorAction(Status.Text);
+                ShowErrorAction(null);
             }
             finally
             {
-                request.ClearSecrets(); running = false; timer.Stop(); silence.Visible = false;
-                // Success already moved to PageDone while running was true; refresh
-                // on any page so «Открыть Hermes» becomes active.
-                if (PageIndex == PageInstall) statusHint.Visible = !action.Visible;
-                RefreshButtons();
+                request.ClearSecrets(); running = false;
+                if (cts != null) { cts.Dispose(); cts = null; }
+                if (!IsDisposed)
+                {
+                    timer.Stop(); silence.Visible = false;
+                    // Success already moved to PageDone while running was true; refresh
+                    // on any page so «Открыть Hermes» becomes active.
+                    if (PageIndex == PageInstall) statusHint.Visible = !action.Visible;
+                    RefreshButtons();
+                    if (closeAfterCancel) { closeAfterCancel = false; Close(); }
+                }
             }
+        }
+
+        // «Отмена» on the install screen (issue #11). Splits the confirmation out so the
+        // offline UI tests can cancel without a modal dialog.
+        public void RequestCancel()
+        {
+            if (!running) return;
+            cancelRequested = true;
+            Status.ForeColor = UiTheme.Muted;
+            Status.Text = "Останавливаю установку…";
+            cancel.Enabled = false;
+            try { if (cts != null) cts.Cancel(); } catch { }
+        }
+        void ConfirmCancel()
+        {
+            if (!running) return;
+            if (MessageBox.Show(this, "Остановить установку? Уже распакованные файлы останутся; папку установки можно будет удалить вручную.", "Отмена установки", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                RequestCancel();
         }
 
         // --- Telegram owner approval (Done screen) -------------------------------
@@ -801,11 +872,16 @@ namespace HermesSetup
             UpdateWraps();
         }
 
-        void ShowErrorAction(string message)
+        void ShowErrorAction(Outcome outcome)
         {
-            bool auth = message != null && message.IndexOf("AUTH", StringComparison.OrdinalIgnoreCase) >= 0;
-            action.Text = auth ? "Изменить ключ" : "Повторить";
+            // Recovery actions come from the structured code, never from a substring of the
+            // message: a provider reply containing "auth" must not flip the button (issue #12).
+            string code = outcome == null ? null : outcome.Code;
+            bool keyIssue = code == "AUTH" || code == "INPUT" || code == "QUOTA" || code == "VERIFY";
+            action.Text = keyIssue ? "Изменить ключ" : "Повторить";
             action.Visible = true;
+            action2.Visible = true;   // always leave a way off the dead end
+            changeProviderOffered = true;
             statusHint.Visible = false;
         }
 

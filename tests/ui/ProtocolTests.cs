@@ -75,6 +75,21 @@ public static class UnitTests
         try { ProviderCatalog.Load(catalogPath); Check(false,"garbage providers.json rejected"); }
         catch { Check(true,"garbage providers.json rejected"); }
         finally { File.Delete(catalogPath); }
+        // Issue #12: recovery actions come from the structured code, not a substring of the
+        // message, and the error screen always offers changing the provider.
+        using (var errForm = new InstallerForm()) {
+            var show = typeof(InstallerForm).GetMethod("ShowErrorAction", System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Instance);
+            var actionBtn = (System.Windows.Forms.Button)errForm.Controls.Find("Action", true)[0];
+            show.Invoke(errForm, new object[]{ new Outcome{ Code="NETWORK", Message="provider said authentication failed" } });
+            Check(actionBtn.Text=="Повторить","a NETWORK error whose text contains 'authentication' still offers Повторить");
+            Check(errForm.ChangeProviderOffered,"the error screen offers changing the provider");
+            show.Invoke(errForm, new object[]{ new Outcome{ Code="AUTH", Message="bad key" } });
+            Check(actionBtn.Text=="Изменить ключ","AUTH offers Изменить ключ");
+            show.Invoke(errForm, new object[]{ new Outcome{ Code="QUOTA", Message="limit reached" } });
+            Check(actionBtn.Text=="Изменить ключ","QUOTA offers Изменить ключ");
+            show.Invoke(errForm, new object[]{ new Outcome{ Code="INSTALL", Message="stage failed" } });
+            Check(actionBtn.Text=="Повторить","INSTALL offers Повторить");
+        }
         Check(WorkerClient.StartInfo("C:/package/backend/worker.ps1").EnvironmentVariables.ContainsKey("OS"), "worker receives OS for platform preflight without inherited secrets");
         // The elevated VC++ redistributable fails with 0x80070003 without these.
         Environment.SetEnvironmentVariable("HERMES_TEST_SECRET_KEY", "must-not-leak");
@@ -102,6 +117,8 @@ public static class UnitTests
 
         var quota = New(null); quota.Feed("{\"type\":\"error\",\"code\":\"QUOTA\",\"message\":\"лимит\"}");
         Check(quota.Finish(1).Message.Contains("QUOTA"), "QUOTA error surfaces with advice");
+        Check(errOutcome.Code=="INSTALL" && quota.Finish(1).Code=="QUOTA",
+              "error outcomes carry the structured code, not only the text (issue #12)");
 
         var ok = New(null); ok.Feed("{\"type\":\"progress\",\"message\":\"шаг\"}");
         Check(!ok.Finish(0).Success, "progress-only stream without final record is rejected");

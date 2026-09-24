@@ -107,6 +107,21 @@ public static class E2eTests
             // 6. Missing worker script: actionable INSTALL failure, not a crash.
             var missing = WorkerClient.RunAsync(Path.Combine(temp, "absent", "backend", "worker.ps1"), new Request { endpoint="https://mock.test/v1", api_key="MOCKKEY12345" }, delegate { }).GetAwaiter().GetResult();
             Check(!missing.Success && missing.Message.Contains("backend"), "missing worker script produces actionable error");
+
+            // 7. Cancellation (issue #11): cancelling kills the worker tree and returns promptly
+            //    instead of hanging until the install would have finished.
+            string slowWorker = WriteWorker(Path.Combine(temp, "slow", "backend"), "$ErrorActionPreference='Stop'\r\n" +
+                "[void]([Console]::In.ReadToEnd())\r\n" +
+                "Start-Sleep -Seconds 120\r\n");
+            var cts = new System.Threading.CancellationTokenSource();
+            var slowTask = WorkerClient.RunAsync(slowWorker, new Request { endpoint="https://mock.test/v1", api_key="MOCKKEY12345" },
+                delegate { }, delegate(int i, int t, string s) { }, cts.Token);
+            System.Threading.Thread.Sleep(1500);
+            cts.Cancel();
+            bool finished = slowTask.Wait(20000);
+            Check(finished, "cancelling the install returns promptly instead of hanging");
+            Check(finished && !slowTask.IsFaulted && !slowTask.Result.Success, "a cancelled install is not reported as success");
+            cts.Dispose();
         }
         finally
         {

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 
@@ -144,15 +145,18 @@ namespace HermesSetup
             return psi;
         }
         public static async Task<Outcome> RunAsync(string worker, Request request, Action<string> progress)
-        { return await RunAsync(worker, request, progress, LaunchPolicy.Validate, null); }
+        { return await RunAsync(worker, request, progress, LaunchPolicy.Validate, null, CancellationToken.None); }
         // Tests may inject a launch validator. Production calls the overload above only.
         public static async Task<Outcome> RunAsync(string worker, Request request, Action<string> progress, Func<string,string[],bool> validator)
-        { return await RunAsync(worker, request, progress, validator, null); }
+        { return await RunAsync(worker, request, progress, validator, null, CancellationToken.None); }
         // The wizard subscribes to the structured stage id (auto-mapped to a human
         // phrase) while keeping the same numbered progress text in the journal.
         public static Task<Outcome> RunAsync(string worker, Request request, Action<string> progress, Action<int,int,string> stage)
-        { return RunAsync(worker, request, progress, LaunchPolicy.Validate, stage); }
-        public static async Task<Outcome> RunAsync(string worker, Request request, Action<string> progress, Func<string,string[],bool> validator, Action<int,int,string> stage)
+        { return RunAsync(worker, request, progress, LaunchPolicy.Validate, stage, CancellationToken.None); }
+        // Cancelling kills the whole worker process tree (worker.ps1 -> install.ps1 -> npm/git).
+        public static Task<Outcome> RunAsync(string worker, Request request, Action<string> progress, Action<int,int,string> stage, CancellationToken cancel)
+        { return RunAsync(worker, request, progress, LaunchPolicy.Validate, stage, cancel); }
+        public static async Task<Outcome> RunAsync(string worker, Request request, Action<string> progress, Func<string,string[],bool> validator, Action<int,int,string> stage, CancellationToken cancel)
         {
             string error = request.Validate();
             if(error!=null) return Outcome.Failure(error);
@@ -167,26 +171,48 @@ namespace HermesSetup
                     if(!process.Start()) return Outcome.Failure("INSTALL: Не удалось запустить Windows PowerShell. Обратитесь в поддержку.");
                 }
                 catch { return Outcome.Failure("INSTALL: Windows заблокировала запуск установщика или PowerShell недоступен. Обратитесь в поддержку; не отключайте защиту Windows."); }
-                Task stdout = Task.Run(delegate { ReadLines(process.StandardOutput, protocol); });
-                Task<bool> stderr = Task.Run(delegate {
-                    bool any=false; char[] chars=new char[1024];
-                    try { int n; while((n=process.StandardError.Read(chars,0,chars.Length))>0) any=true; }
-                    catch { any=true; } return any;
-                });
-                bool writeFailed=false;
+                // Cancelling (the wizard's «Отмена») kills the whole owned tree; the worker
+                // never orphans npm/git/runtime children.
+                CancellationTokenRegistration cancelReg = default(CancellationTokenRegistration);
+                if (cancel.CanBeCanceled) cancelReg = cancel.Register(delegate { KillProcessTree(process.Id); });
                 try
                 {
-                    byte[] bytes = new UTF8Encoding(false,true).GetBytes(new JavaScriptSerializer().Serialize(request)+"\n");
-                    try { await process.StandardInput.BaseStream.WriteAsync(bytes,0,bytes.Length); await process.StandardInput.BaseStream.FlushAsync(); }
-                    finally { Array.Clear(bytes,0,bytes.Length); }
+                    Task stdout = Task.Run(delegate { ReadLines(process.StandardOutput, protocol); });
+                    Task<bool> stderr = Task.Run(delegate {
+                        bool any=false; char[] chars=new char[1024];
+                        try { int n; while((n=process.StandardError.Read(chars,0,chars.Length))>0) any=true; }
+                        catch { any=true; } return any;
+                    });
+                    bool writeFailed=false;
+                    try
+                    {
+                        byte[] bytes = new UTF8Encoding(false,true).GetBytes(new JavaScriptSerializer().Serialize(request)+"\n");
+                        try { await process.StandardInput.BaseStream.WriteAsync(bytes,0,bytes.Length); await process.StandardInput.BaseStream.FlushAsync(); }
+                        finally { Array.Clear(bytes,0,bytes.Length); }
+                    }
+                    catch { writeFailed=true; }
+                    finally { try { process.StandardInput.Close(); } catch {} }
+                    await Task.Run(delegate { process.WaitForExit(); });
+                    await stdout;
+                    if(await stderr || writeFailed) protocol.Invalidate();
+                    return protocol.Finish(process.ExitCode);
                 }
-                catch { writeFailed=true; }
-                finally { try { process.StandardInput.Close(); } catch {} }
-                await Task.Run(delegate { process.WaitForExit(); });
-                await stdout;
-                if(await stderr || writeFailed) protocol.Invalidate();
-                return protocol.Finish(process.ExitCode);
+                finally { cancelReg.Dispose(); }
             }
+        }
+        // taskkill /T /F on the worker PID kills the whole tree (worker -> install.ps1 -> npm/git).
+        // Mirrors worker.ps1's own Run-Child timeout kill.
+        internal static void KillProcessTree(int pid)
+        {
+            try
+            {
+                var kill = new ProcessStartInfo(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "taskkill.exe"),
+                    "/PID " + pid + " /T /F");
+                kill.UseShellExecute = false; kill.CreateNoWindow = true;
+                kill.RedirectStandardOutput = true; kill.RedirectStandardError = true;
+                using (var p = Process.Start(kill)) { p.WaitForExit(5000); }
+            }
+            catch { }
         }
         // Short Done-screen actions: "telegram_pending" (no arguments) or "telegram_approve"
         // (request id + user id picked by the owner's click). Same process contract as install:

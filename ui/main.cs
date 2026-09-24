@@ -13,6 +13,9 @@ namespace HermesSetup
     {
         public bool Success;
         public string Message;
+        // Backend error code (AUTH/NETWORK/QUOTA/INSTALL/CONFIG/VERIFY/...). Null on success
+        // or a non-protocol failure. The UI picks recovery actions from this, not from the text.
+        public string Code;
         public string LaunchPath;
         public string[] LaunchArgs;
         // Install success only: bot username ("-" = connected, name unknown) when the Telegram bot
@@ -157,7 +160,7 @@ namespace HermesSetup
                     string code = Text(record, "code");
                     string advice = ErrorAdvice(code);
                     if (advice == null) throw new FormatException();
-                    final = Outcome.Failure(code + ": " + advice + "\r\n" + SafeText(message));
+                    final = new Outcome { Code = code, Message = code + ": " + advice + "\r\n" + SafeText(message) };
                     terminal = true;
                     return;
                 }
