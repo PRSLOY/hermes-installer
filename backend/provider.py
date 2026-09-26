@@ -22,13 +22,18 @@ def tls_context():
     Context7, DeepWiki) until the OS fetches them on demand; Python reads the
     store as-is and fails where PowerShell succeeds. certifi is pinned by Hermes
     itself (certifi==2026.5.20), so it is present in the venv we run under.
+    The Windows store is loaded as well: HTTPS-scanning antivirus (Kaspersky,
+    Dr.Web, ESET) re-signs traffic with a root it installs only there, and a
+    certifi-only context failed the key check as a network error.
     """
     import ssl
+    ctx = ssl.create_default_context()
     try:
         import certifi
-        return ssl.create_default_context(cafile=certifi.where())
+        ctx.load_verify_locations(cafile=certifi.where())
     except Exception:
-        return ssl.create_default_context()
+        pass
+    return ctx
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):

@@ -5,8 +5,14 @@ $script:CheckpointDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -
 function Assert-SafePath([string]$Path) {
     $full = [IO.Path]::GetFullPath($Path)
     if ($full -notmatch '^[A-Za-z]:\\' -or $full.Substring(3) -match '[:*?]' -or $full -match '[ .](\\|$)') { Fail 'CONFIG' 'Небезопасный путь установки.' }
+    # Links are refused from the Hermes folder down. %LOCALAPPDATA% itself and everything
+    # above it is the profile's own layout: an AppData or profile moved to another drive
+    # with a junction is common and not ours to judge. Outside %LOCALAPPDATA% (a custom
+    # HERMES_HOME) every ancestor is still checked.
+    $base = if ($env:LOCALAPPDATA) { [IO.Path]::GetFullPath($env:LOCALAPPDATA).TrimEnd('\') } else { '' }
     $part = $full
     while ($part) {
+        if ($base -and $part.TrimEnd('\') -ieq $base) { break }
         $item = Get-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
         if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Fail 'CONFIG' 'Ссылки и junction в путях установки запрещены.' }
         $part = [IO.Path]::GetDirectoryName($part)
@@ -44,7 +50,10 @@ function Write-Journal($State, [switch]$New) {
         if ($New) { [IO.File]::Move($tmp,$path) } else { [IO.File]::Replace($tmp,$path,[NullString]::Value) }
     } finally { if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) } }
 }
-function Read-Journal($HomeDir, $Repo, $Pin, $Sid) {
+# -AnyRevision: a journal written by an earlier package (another pinned Hermes commit).
+# Maintenance of a completed install («Hermes уже установлен») never reinstalls Hermes,
+# so the pin of the package that installed it does not have to match this package's.
+function Read-Journal($HomeDir, $Repo, $Pin, $Sid, [switch]$AnyRevision) {
     $null=Assert-SafePath $HomeDir; $null=Assert-SafePath $Repo
     $path=Journal-Path $HomeDir; $null=Assert-SafePath $path
     try {
@@ -54,7 +63,8 @@ function Read-Journal($HomeDir, $Repo, $Pin, $Sid) {
         $s=[Text.Encoding]::UTF8.GetString($bytes)|ConvertFrom-Json
         $fields=@($s.PSObject.Properties.Name|Sort-Object)
         if (($fields -join ',') -cne 'fingerprints,home,owner,phase,repo,revision,schema,sid') { throw 'schema' }
-        if ($s.schema -isnot [int] -or $s.schema -ne 1 -or $s.owner -cne 'HermesSubscriberSetup' -or $s.sid -cne $Sid -or $s.home -cne $HomeDir -or $s.repo -cne $Repo -or $s.revision -cne $Pin -or $Pin -notmatch '^[0-9a-f]{40}$') { throw 'identity' }
+        $revisionOk = if ($AnyRevision) { $s.revision -is [string] -and $s.revision -cmatch '^[0-9a-f]{40}$' } else { $s.revision -ceq $Pin }
+        if ($s.schema -isnot [int] -or $s.schema -ne 1 -or $s.owner -cne 'HermesSubscriberSetup' -or $s.sid -cne $Sid -or $s.home -cne $HomeDir -or $s.repo -cne $Repo -or -not $revisionOk -or $Pin -notmatch '^[0-9a-f]{40}$') { throw 'identity' }
         if ($s.phase -notin @('installing','awaiting_api','configuring','completed')) { throw 'phase' }
         if ($s.phase -eq 'installing') {
             $f=@($s.fingerprints)
@@ -191,9 +201,14 @@ function Preserve-IncompleteInstall($State) {
         [IO.Directory]::Move($State.home,$park)
         Send-Event @{type='progress';message=('Прошлая установка была прервана. Её файлы отложены в ' + $park + ' (их можно удалить). Ставлю заново.')}
     }
-    $State.fingerprints=@(); Write-Journal $State
+    # 'installing' with no snapshot is the only valid shape for an empty fingerprint list:
+    # a parked awaiting_api/completed journal must stay readable if this run dies next.
+    $State.phase='installing'; $State.fingerprints=@(); Write-Journal $State
 }
 # Standalone configure authorization; does not accept UI freshness assertions.
+# Third argument 'maintain' («Сменить провайдера или ключ»): a COMPLETED install of ours,
+# any package revision. Its snapshot is not compared: config.yaml/.env legitimately
+# change after completion (the set, Telegram, backups, Hermes itself).
 if ($MyInvocation.InvocationName -ne '.') {
     $ErrorActionPreference='Stop'
     function Fail($Code,$Message) { throw $Message }
@@ -201,7 +216,14 @@ if ($MyInvocation.InvocationName -ne '.') {
         . (Join-Path $PSScriptRoot 'checkpoint.ps1')
         $h=Assert-SafePath $args[0]; $r=Assert-SafePath $args[1]
         $pin=(Get-Content (Join-Path $PSScriptRoot 'upstream\commit.txt') -Raw).Trim()
-        $s=Read-Journal $h $r $pin ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+        $maintain=($args.Count -ge 3 -and $args[2] -ceq 'maintain')
+        if ($args.Count -gt 3 -or ($args.Count -eq 3 -and -not $maintain)) { throw 'arguments' }
+        $s=Read-Journal $h $r $pin ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -AnyRevision:$maintain
+        if ($maintain) {
+            if ($s.phase -cne 'completed') { throw 'phase' }
+            [Console]::WriteLine('authorized')
+            exit 0
+        }
         if ($s.phase -cne 'configuring') { throw 'phase' }
         Assert-JournalSnapshot $s
         [Console]::WriteLine('authorized')

@@ -170,11 +170,44 @@ def run_gateway_cli(home, repo, args):
     return result.returncode == 0
 
 
+def startup_vbs_paths(home):
+    paths = [Path(home) / 'gateway-service' / (TASK_NAME + '.vbs')]
+    appdata = os.environ.get('APPDATA', '').strip()
+    if appdata:
+        paths.append(Path(appdata) / 'Microsoft/Windows/Start Menu/Programs/Startup' / (TASK_NAME + '.vbs'))
+    return paths
+
+
+def vbs_readable(path):
+    """Windows Script Host reads a .vbs as the ANSI code page unless it starts with a
+    UTF-16 BOM. Upstream writes UTF-8 without BOM (gateway_windows.py), so for a
+    Cyrillic user name the launcher's paths turn into mojibake and the gateway never
+    starts after a reboot (environments review 2026-09-24, reproduced on ACP 1251)."""
+    data = path.read_bytes()
+    return data.startswith(b'\xff\xfe') or all(b < 0x80 for b in data)
+
+
+def fix_vbs_encoding(home):
+    """Rewrite each launcher as UTF-16LE with BOM; the content is unchanged."""
+    for path in startup_vbs_paths(home):
+        try:
+            if not path.is_file() or vbs_readable(path):
+                continue
+            text = path.read_bytes().decode('utf-8-sig')
+            tmp = path.with_name(path.name + '.' + uuid.uuid4().hex)
+            tmp.write_bytes(b'\xff\xfe' + text.encode('utf-16-le'))
+            os.replace(tmp, path)
+        except (OSError, UnicodeError):
+            pass
+
+
 def enable_gateway(home, repo, restart):
     if not run_gateway_cli(home, repo, ['install', '--start-now', '--start-on-login']):
         return False
     # A gateway that was already running read .env before the token existed.
-    return run_gateway_cli(home, repo, ['restart']) if restart else True
+    ok = run_gateway_cli(home, repo, ['restart']) if restart else True
+    fix_vbs_encoding(home)
+    return ok
 
 
 def wait_connected(home, since, timeout=CONNECT_TIMEOUT, sleep=time.sleep, clock=time.time):
@@ -203,11 +236,15 @@ def autostart_state(home):
     """Where login autostart lives: 'task' | 'startup' | None. Mirrors
     gateway_windows.is_task_registered() / is_startup_entry_installed(), plus the
     launcher both of them run (<HERMES_HOME>/gateway-service/Hermes_Gateway.vbs)."""
-    if not (Path(home) / 'gateway-service' / (TASK_NAME + '.vbs')).is_file():
+    launcher, *startup = startup_vbs_paths(home)
+    # A launcher Windows cannot read (see vbs_readable) is no autostart at all.
+    try:
+        if not launcher.is_file() or not vbs_readable(launcher):
+            return None
+        if startup and startup[0].is_file():
+            return 'startup' if vbs_readable(startup[0]) else None
+    except OSError:
         return None
-    appdata = os.environ.get('APPDATA', '').strip()
-    if appdata and (Path(appdata) / 'Microsoft/Windows/Start Menu/Programs/Startup' / (TASK_NAME + '.vbs')).is_file():
-        return 'startup'
     schtasks = Path(os.environ.get('SYSTEMROOT', r'C:\Windows')) / 'System32' / 'schtasks.exe'
     try:
         result = subprocess.run([str(schtasks), '/Query', '/TN', TASK_NAME], stdin=subprocess.DEVNULL,

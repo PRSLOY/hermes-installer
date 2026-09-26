@@ -215,6 +215,65 @@ class LayoutTests {
      int length=f.Log.TextLength;
      typeof(System.Windows.Forms.Timer).GetMethod("OnTick",BindingFlags.NonPublic|BindingFlags.Instance).Invoke(timer,new object[]{EventArgs.Empty});
      Require(f.Log.TextLength==length,"elapsed timer pollutes log");
+     // Maintenance screen («Hermes уже установлен» / «У вас уже есть Hermes») in its tallest
+     // states: ours with an update and a long model id, foreign with and without a usable
+     // Python, the bot-token entry, a running action and a long error; then the Done-screen
+     // Telegram approval reached from it (with «Назад»).
+     {
+      var maintPage=f.Controls.Find("PageMaintain",true)[0];
+      var doneCtl=f.Controls.Find("PageDone",true)[0];
+      var footer=f.Controls.Find("Footer",true)[0];
+      var runningField=typeof(InstallerForm).GetField("running",BindingFlags.NonPublic|BindingFlags.Instance);
+      var barField=typeof(InstallerForm).GetField("maintBar",BindingFlags.NonPublic|BindingFlags.Instance);
+      var ours=new InstallStatus{State="ours_completed",Message="Hermes уже установлен этим установщиком.",SetSupported=true,ModelOurs=true,BaseUrl="https://inference.dahl.global/v1",
+       Model="MiniMaxAI/MiniMax-M2.7-a-very-long-model-identifier",SetVersion="0.1.2",PackageSetVersion="0.1.3",Telegram=true,Backups=3,LaunchPath=""};
+      var foreign=new InstallStatus{State="foreign",Message="Найден Hermes, установленный не этим установщиком.",SetSupported=true,SetVersion="",PackageSetVersion="0.1.3",BaseUrl="",Model="",LaunchPath=""};
+      var broken=new InstallStatus{State="foreign",Message="Найдена папка Hermes без рабочей установки.",SetSupported=false,SetVersion="",PackageSetVersion="0.1.3",BaseUrl="",Model="",LaunchPath=""};
+      var longError=Outcome.Failure("CONFIG","CONFIG: "+Protocol.ErrorAdvice("CONFIG")+"\r\nНастройки модели изменены вне установщика (например, в Hermes). Чтобы их не потерять, смените провайдера в самом Hermes → «Настройки».");
+      string[] shots={"screen5-maintain-ours-","screen5-maintain-foreign-","screen5-maintain-broken-","screen5-maintain-telegram-","screen5-maintain-running-","screen5-maintain-error-"};
+      InstallStatus[] states={ours,foreign,broken,ours,ours,ours};
+      for(int i=0;i<shots.Length;i++) {
+       string where=tag+" "+shots[i].Trim('-');
+       f.ApplyStatus(states[i]);
+       f.ShowTelegramEntry(i==3);
+       if(i==3) f.MaintTelegramToken.Text="123456789:LAYOUTFAKETOKENLAYOUTFAKETOKEN123";
+       if(i==4) { runningField.SetValue(f,true); ((ProgressBar)barField.GetValue(f)).Visible=true; f.MaintStatus.Text="Настраиваю набор: личность помощника, первые шаги, калькулятор и справочники…"; }
+       if(i==5) f.ShowMaintenanceResult(longError);
+       f.GoTo(InstallerForm.PageMaintain); Settle(f);
+       int top=f.PointToClient(footer.PointToScreen(Point.Empty)).Y;
+       CheckKeyPage(f,maintPage,top,where);
+       if(i==4) Require(f.Controls.Find("CancelInstall",true)[0].Visible, where+": «Отменить» shown while an action runs");
+       else Require(f.Controls.Find("Launch",true)[0].Visible, where+": «Открыть Hermes» present");
+       Snap(f,dir,shots[i]+tag);
+       runningField.SetValue(f,false); ((ProgressBar)barField.GetValue(f)).Visible=false;
+       f.ShowTelegramEntry(false); f.MaintTelegramToken.Clear(); f.MaintStatus.Text="";
+      }
+      f.ApplyStatus(ours);
+      // The tallest approval block: with the «автозапуск не настроен» line.
+      f.OpenTelegramApproval("my_hermes_bot", true); Settle(f);
+      int doneTop=f.PointToClient(footer.PointToScreen(Point.Empty)).Y;
+      CheckKeyPage(f,doneCtl,doneTop,tag+" done-telegram from maintenance");
+      Require(f.Back.Visible, tag+": «Назад» returns from the approval to the maintenance screen");
+      Snap(f,dir,"screen4-done-telegram-"+tag);
+      // Done after a Cancel during the optional steps: examples plus the «пропущены» note, and
+      // the launch-error note in the same place.
+      using(var g=new InstallerForm()) {
+       g.AutoScaleMode=AutoScaleMode.None; g.ClientSize=size;
+       if(scale!=1) { g.Scale(new SizeF(scale,scale)); ScaleFonts(g,scale); }
+       g.Show(); Settle(g);
+       var p=new Protocol(null,delegate{},delegate{return true;});
+       p.Feed("{\"type\":\"configured\",\"message\":\"x\",\"launch_path\":\"C:\\\\x\\\\Hermes.exe\"}");
+       var partial=WorkerClient.AfterConfigured(p,Outcome.Failure(Outcome.CodeCancelled,WorkerClient.StoppedMessage));
+       foreach(string note in new[]{ partial.Message, InstallerForm.LaunchFailedText(@"C:\Users\Длинное Имя Пользователя\AppData\Local\hermes\hermes-agent\apps\desktop\release\win-unpacked\Hermes.exe") }) {
+        g.TelegramNote.Text=note; g.TelegramNote.Visible=true;
+        g.GoTo(InstallerForm.PageDone); Settle(g);
+        var gFooter=g.Controls.Find("Footer",true)[0];
+        CheckKeyPage(g,g.Controls.Find("PageDone",true)[0],g.PointToClient(gFooter.PointToScreen(Point.Empty)).Y,tag+" done with a note");
+       }
+       Snap(g,dir,"screen4-done-note-"+tag);
+       g.Close();
+      }
+     }
      f.Close();
     }
    }
@@ -248,7 +307,7 @@ class LayoutTests {
      d.Close();
     }
    }
-   Console.WriteLine("PASS layout: 4 screens x 6 sizes plus install-with-cancel, stopped and error screens x 6 sizes, key screen with the backup summary per provider, backup dialog at 3 scales, nothing clipped, no in-window scrollbars, log scroll preserved; scaling is SIMULATED, not OS DPI.");
+   Console.WriteLine("PASS layout: 4 screens x 6 sizes plus install-with-cancel, stopped and error screens x 6 sizes, key screen with the backup summary per provider, maintenance screen in 6 states + Telegram approval from it x 6 sizes, backup dialog at 3 scales, nothing clipped, no in-window scrollbars, log scroll preserved; scaling is SIMULATED, not OS DPI.");
    return 0;
   } catch(Exception e) { Console.Error.WriteLine(e); return 1; }
  }

@@ -3,6 +3,8 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Text;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
@@ -24,6 +26,13 @@ namespace HermesSetup
         // Failure only: the protocol error code (AUTH, QUOTA, ...), or one of the two codes the
         // UI itself produces when it stops the worker. The UI decides by this, never by text.
         public string Code;
+        // "status" action only: what is installed (the «Hermes уже установлен» screen).
+        public InstallStatus Status;
+        // Maintenance actions only: "ok" or "partial" (a non-terminal step fell short; Hermes works).
+        public string MaintenanceStatus;
+        // Install only: the key was verified and saved (worker "configured" record), then an
+        // optional step was stopped or timed out. Hermes works; the Done screen says what was skipped.
+        public bool Partial;
         public const string CodeCancelled = "CANCELLED", CodeTimeout = "TIMEOUT";
         public bool Cancelled { get { return Code == CodeCancelled; } }
         // "CODE: text" messages carry their code; any other text has none.
@@ -36,6 +45,35 @@ namespace HermesSetup
         public static Outcome Failure(string code, string text) { return new Outcome { Code = code, Message = text }; }
     }
 
+    // Reply of the worker's "status" action. Never carries a secret: the key and the bot token
+    // are only reported as present or not; BaseUrl/Model are the provider's public address.
+    public sealed class InstallStatus
+    {
+        public const string None = "none", OursIncomplete = "ours_incomplete", OursCompleted = "ours_completed", Foreign = "foreign";
+        public string State, Message, LaunchPath, BaseUrl, Model, SetVersion, PackageSetVersion;
+        public bool SetSupported, ModelOurs, Telegram;
+        // A provider change was killed between its two writes: key and address may not match.
+        public bool ChangeInterrupted;
+        public int Backups;
+        public bool Existing { get { return State == OursCompleted || State == Foreign; } }
+        // «Обновить набор» is recommended when the package ships a newer set than the one recorded.
+        public bool UpdateAvailable
+        {
+            get
+            {
+                Version shipped, installed;
+                if (!Version.TryParse(Normalize(PackageSetVersion), out shipped)) return false;
+                if (!Version.TryParse(Normalize(SetVersion), out installed)) return true;
+                return shipped > installed;
+            }
+        }
+        static string Normalize(string v) { return String.IsNullOrEmpty(v) ? "" : (v.IndexOf('.') < 0 ? v + ".0" : v); }
+        public string ProviderHost
+        {
+            get { Uri uri; return Uri.TryCreate(BaseUrl ?? "", UriKind.Absolute, out uri) ? uri.Host : ""; }
+        }
+    }
+
     public sealed class TelegramRequest
     {
         public string Id, UserId, Name, Username;
@@ -46,6 +84,59 @@ namespace HermesSetup
                 string name = String.IsNullOrEmpty(Name) ? "Без имени" : Name;
                 return String.IsNullOrEmpty(Username) ? name : name + " (@" + Username + ")";
             }
+        }
+    }
+
+    // «Запуск от имени администратора» by a standard user with someone else's admin password runs
+    // the installer AS that admin: Hermes would land in the admin's profile, not the person's.
+    // Detected as: elevated token whose user differs from the owner of this session's desktop
+    // shell (explorer.exe). Same-user elevation (and Windows Sandbox, elevated as its only user)
+    // is fine. Any lookup failure = no warning: this guard never blocks a normal run.
+    public static class ElevationGuard
+    {
+        public const string Message = "Запустите установщик двойным щелчком, без прав администратора.\r\n\r\nСейчас он запущен от имени другой учётной записи, и Hermes установился бы ей, а не вам.";
+        [DllImport("user32.dll")] static extern IntPtr GetShellWindow();
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint processId);
+        [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+        const uint ProcessQueryLimitedInformation = 0x1000, TokenQuery = 0x0008;
+
+        public static string ShellOwnerSid()
+        {
+            IntPtr process = IntPtr.Zero, token = IntPtr.Zero;
+            try
+            {
+                uint pid;
+                IntPtr shell = GetShellWindow();
+                if (shell == IntPtr.Zero || GetWindowThreadProcessId(shell, out pid) == 0 || pid == 0) return null;
+                process = OpenProcess(ProcessQueryLimitedInformation, false, pid);
+                if (process == IntPtr.Zero || !OpenProcessToken(process, TokenQuery, out token)) return null;
+                using (var identity = new WindowsIdentity(token)) return identity.User == null ? null : identity.User.Value;
+            }
+            catch { return null; }
+            finally
+            {
+                if (token != IntPtr.Zero) CloseHandle(token);
+                if (process != IntPtr.Zero) CloseHandle(process);
+            }
+        }
+        // Pure decision (tests): warn only for an elevated run whose user is not the shell's.
+        public static bool Warn(bool elevated, string runningSid, string shellSid)
+        {
+            return elevated && !String.IsNullOrEmpty(runningSid) && !String.IsNullOrEmpty(shellSid) && !String.Equals(runningSid, shellSid, StringComparison.OrdinalIgnoreCase);
+        }
+        public static bool ShouldWarn()
+        {
+            try
+            {
+                using (var me = WindowsIdentity.GetCurrent())
+                {
+                    bool elevated = new WindowsPrincipal(me).IsInRole(WindowsBuiltInRole.Administrator);
+                    return Warn(elevated, me.User == null ? null : me.User.Value, elevated ? ShellOwnerSid() : null);
+                }
+            }
+            catch { return false; }
         }
     }
 
@@ -93,6 +184,14 @@ namespace HermesSetup
         // Telegram action session: the only terminal success is {"type":"telegram",...};
         // an install "success" (launch path) is then a protocol violation, and vice versa.
         public bool TelegramMode;
+        // "status" session: the only terminal success is {"type":"status",...}. Maintenance session
+        // (update_set, change_provider, add_backups, telegram_connect, foreign_add_set): {"type":"done",...}.
+        public bool StatusMode, MaintenanceMode;
+        // Install session: set by the non-terminal {"type":"configured"} record once the key is
+        // verified and saved (phase completed). Only a LaunchPolicy-valid Desktop path is accepted.
+        public string ConfiguredLaunchPath { get; private set; }
+        static readonly string[] States = { InstallStatus.None, InstallStatus.OursIncomplete, InstallStatus.OursCompleted, InstallStatus.Foreign };
+        static readonly System.Text.RegularExpressions.Regex VersionShape = new System.Text.RegularExpressions.Regex("^([0-9]{1,4}(\\.[0-9]{1,4}){0,3})?$");
         static readonly string[] TelegramStatuses = { "pending", "none", "done", "off", "failed", "approved", "approved_partial", "expired" };
         static readonly System.Text.RegularExpressions.Regex RequestIdShape = new System.Text.RegularExpressions.Regex("^[0-9a-f]{16}$");
         static readonly System.Text.RegularExpressions.Regex UserIdShape = new System.Text.RegularExpressions.Regex("^[0-9]{1,20}$");
@@ -131,6 +230,49 @@ namespace HermesSetup
             object value;
             if (!record.TryGetValue(name, out value) || !(value is string) || String.IsNullOrWhiteSpace((string)value)) throw new FormatException();
             return (string)value;
+        }
+        // A string field that may be empty, without control characters.
+        static string Plain(Dictionary<string,object> record, string name, int max)
+        {
+            object value;
+            if (!record.TryGetValue(name, out value) || !(value is string)) throw new FormatException();
+            string text = (string)value;
+            if (text.Length > max) throw new FormatException();
+            foreach (char c in text) if (Char.IsControl(c)) throw new FormatException();
+            return text;
+        }
+        static bool Flag(Dictionary<string,object> record, string name)
+        {
+            object value;
+            if (!record.TryGetValue(name, out value) || !(value is bool)) throw new FormatException();
+            return (bool)value;
+        }
+        InstallStatus ParseStatus(Dictionary<string,object> record)
+        {
+            if (!StatusMode || record.Count != 13) throw new FormatException();
+            var s = new InstallStatus { State = Text(record, "state") };
+            if (Array.IndexOf(States, s.State) < 0) throw new FormatException();
+            s.BaseUrl = Plain(record, "base_url", 2048);
+            if (s.BaseUrl.Length > 0)
+            {
+                Uri uri;
+                if (!Uri.TryCreate(s.BaseUrl, UriKind.Absolute, out uri) || uri.Scheme != "https" || uri.UserInfo != "" || uri.Query != "" || uri.Fragment != "" || s.BaseUrl.IndexOf(' ') >= 0) throw new FormatException();
+            }
+            s.Model = SafeText(Plain(record, "model", 256));
+            s.SetVersion = Plain(record, "set_version", 24);
+            s.PackageSetVersion = Plain(record, "package_set_version", 24);
+            if (!VersionShape.IsMatch(s.SetVersion) || !VersionShape.IsMatch(s.PackageSetVersion)) throw new FormatException();
+            s.SetSupported = Flag(record, "set_supported");
+            s.ModelOurs = Flag(record, "model_ours");
+            s.Telegram = Flag(record, "telegram");
+            s.ChangeInterrupted = Flag(record, "change_interrupted");
+            object backups;
+            if (!record.TryGetValue("backups", out backups) || !(backups is int) || (int)backups < 0 || (int)backups > 99) throw new FormatException();
+            s.Backups = (int)backups;
+            // Only the packed Desktop at the expected place may be launched; anything else = no launch.
+            string launch = Plain(record, "launch_path", 1024);
+            s.LaunchPath = launch.Length > 0 && launchValidator(launch, new string[0]) ? launch : "";
+            return s;
         }
         public void Feed(string line)
         {
@@ -198,7 +340,35 @@ namespace HermesSetup
                     terminal = true;
                     return;
                 }
-                if (TelegramMode || type != "success" || (record.Count != 4 && !(record.Count == 5 && record.ContainsKey("telegram_bot")))) throw new FormatException();
+                if (type == "configured")
+                {
+                    if (TelegramMode || StatusMode || MaintenanceMode || ConfiguredLaunchPath != null || record.Count != 3) throw new FormatException();
+                    string configured = Text(record, "launch_path");
+                    if (!launchValidator(configured, new string[0])) throw new FormatException();
+                    ConfiguredLaunchPath = configured;
+                    progress(SafeText(message));
+                    return;
+                }
+                if (type == "status")
+                {
+                    InstallStatus status = ParseStatus(record);
+                    status.Message = SafeText(message);
+                    final = new Outcome { Success = true, Message = status.Message, Status = status };
+                    terminal = true;
+                    return;
+                }
+                if (type == "done")
+                {
+                    if (!MaintenanceMode || (record.Count != 3 && !(record.Count == 4 && record.ContainsKey("telegram_bot")))) throw new FormatException();
+                    string result = Text(record, "status");
+                    if (result != "ok" && result != "partial") throw new FormatException();
+                    string doneBot = null;
+                    if (record.Count == 4) { doneBot = Text(record, "telegram_bot"); if (!BotShape.IsMatch(doneBot)) throw new FormatException(); }
+                    final = new Outcome { Success = true, Message = SafeText(message), MaintenanceStatus = result, TelegramBot = doneBot };
+                    terminal = true;
+                    return;
+                }
+                if (TelegramMode || StatusMode || MaintenanceMode || type != "success" || (record.Count != 4 && !(record.Count == 5 && record.ContainsKey("telegram_bot")))) throw new FormatException();
                 string bot = null;
                 if (record.Count == 5) { bot = Text(record, "telegram_bot"); if (!BotShape.IsMatch(bot)) throw new FormatException(); }
                 string path = Text(record, "launch_path");

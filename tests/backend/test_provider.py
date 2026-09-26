@@ -55,6 +55,9 @@ class ProviderTests(unittest.TestCase):
         self.assertTrue(ctx.check_hostname)
         bundle = ssl.create_default_context(cafile=certifi.where())
         self.assertGreaterEqual(len(ctx.get_ca_certs()), len(bundle.get_ca_certs()))
+        # ...and the Windows store too: HTTPS-scanning antivirus roots live only there.
+        store = {c['serialNumber'] for c in ssl.create_default_context().get_ca_certs()}
+        self.assertTrue(store <= {c['serialNumber'] for c in ctx.get_ca_certs()})
         # Every installer opener must use it, not the default context.
         src = {name: (ROOT / 'backend' / name).read_text(encoding='utf-8') for name in ('provider.py', 'extras.py', 'telegram.py')}
         for name, text in src.items():

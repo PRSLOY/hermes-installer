@@ -50,15 +50,18 @@ class DownloadRetryTests(unittest.TestCase):
                       'with a truncated archive')
 
     def test_node_download_is_retried(self):
-        i = self.src.index('$indexUrl = "https://nodejs.org/dist/latest-v')
+        # Issue #22: a pinned Node build, verified by SHA-256, retried per source and mirrored.
+        i = self.src.index("$nodePin = '")
         block = self.src[i:i + 1400]
-        self.assertIn('Invoke-DownloadWithRetry', block,
-                      'the Node.js index and zip must also retry -- same single-shot pattern')
+        self.assertIn('Invoke-DownloadFromSources', block,
+                      'the Node.js zip must retry across sources -- same single-shot pattern')
+        self.assertIn('-Sha256 $nodeSha[$arch]', block, 'the Node.js zip must be verified against the pinned SHA-256')
+        self.assertIn('https://nodejs.org/dist/v$nodePin/', block, 'nodejs.org stays the first source')
 
     def test_repo_archive_download_is_retried(self):
         i = self.src.index('$zipPath = "$env:TEMP\\hermes-agent-$zipLabel.zip"')
-        # Wider window: the per-source tree verification comment now precedes the call.
-        block = self.src[i:i + 2600]
+        # Wider window: the tree verification comment and the private extraction folder precede the call.
+        block = self.src[i:i + 4500]
         # Retried per source (direct GitHub then archive proxies).
         self.assertIn('Invoke-DownloadFromSources', block,
                       'the fallback repo ZIP download must retry as well')

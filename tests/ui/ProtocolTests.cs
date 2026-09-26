@@ -146,7 +146,216 @@ public static class UnitTests
         Check(new Request { endpoint = "https://x/v1", api_key = "TESTKEY123" }.Validate() == null, "request validation accepts well-formed request");
         FallbackTests(catalogPath);
         FailureActionTests(catalogPath);
+        MaintenanceProtocolTests();
+        MaintenanceScreenTests(catalogPath);
+        AfterConfiguredTests(catalogPath);
         return Environment.ExitCode;
+    }
+
+    // --- stop/timeout after the key was verified, launch errors, elevation, autostart ------
+    static void AfterConfiguredTests(string catalogPath)
+    {
+        const string configured = "{\"type\":\"configured\",\"message\":\"Ключ проверен\",\"launch_path\":\"C:\\\\x\\\\Hermes.exe\"}";
+        var p = New(delegate { }); p.Feed(configured);
+        Check(p.ConfiguredLaunchPath == "C:\\x\\Hermes.exe", "configured record remembers the verified Desktop path");
+        var stopped = WorkerClient.AfterConfigured(p, Outcome.Failure(Outcome.CodeCancelled, WorkerClient.StoppedMessage));
+        Check(stopped.Success && stopped.Partial && stopped.LaunchPath == "C:\\x\\Hermes.exe" && stopped.Message.Contains("Необязательные шаги пропущены") && stopped.Message.Contains("остановлена"),
+              "Cancel after the key was saved ends on Done (optional steps skipped), not on «Повторить»");
+        var hung = WorkerClient.AfterConfigured(p, Outcome.Failure(Outcome.CodeTimeout, WorkerClient.HungMessage));
+        Check(hung.Success && hung.Partial, "the hung-worker stop after the key was saved ends on Done too");
+        var early = WorkerClient.AfterConfigured(New(null), Outcome.Failure(Outcome.CodeCancelled, WorkerClient.StoppedMessage));
+        Check(!early.Success && early.Cancelled, "a stop before the key was saved stays a stop with «Повторить»");
+        var bad = new Protocol(null, delegate { }, delegate { return false; }); bad.Feed(configured);
+        Check(bad.ConfiguredLaunchPath == null && !bad.Finish(0).Success, "configured with a path LaunchPolicy rejects is a protocol violation");
+        var twice = New(delegate { }); twice.Feed(configured); twice.Feed(configured);
+        Check(!twice.Finish(0).Success, "a second configured record is rejected");
+        var inMaint = MaintProtocol(); inMaint.Feed(configured);
+        Check(!inMaint.Finish(0).Success, "configured is an install-only record");
+        var ok = New(delegate { }); ok.Feed(configured); ok.Feed(SuccessLine("C:\\\\x\\\\Hermes.exe"));
+        Check(ok.Finish(0).Success && !WorkerClient.AfterConfigured(ok, ok.Finish(0)).Partial, "a normal success is untouched");
+
+        Check(ElevationGuard.Warn(true, "S-1-5-21-1-500", "S-1-5-21-1-1001"), "elevated as another account = warn");
+        Check(!ElevationGuard.Warn(true, "S-1-5-21-1-1001", "S-1-5-21-1-1001"), "same-user elevation (and Windows Sandbox) = no warning");
+        Check(!ElevationGuard.Warn(false, "S-1-5-21-1-500", "S-1-5-21-1-1001"), "not elevated = no warning");
+        Check(!ElevationGuard.Warn(true, "S-1-5-21-1-500", null), "unknown shell owner = no warning (never blocks a normal run)");
+        Check(ElevationGuard.Message.Contains("двойным щелчком"), "the warning tells how to start it");
+
+        var env = WorkerClient.StartInfo("C:/package/backend/worker.ps1").EnvironmentVariables;
+        Environment.SetEnvironmentVariable("HTTPS_PROXY", "http://127.0.0.1:3067");
+        Environment.SetEnvironmentVariable("NODE_EXTRA_CA_CERTS", "C:\\ca.pem");
+        try {
+            env = WorkerClient.StartInfo("C:/package/backend/worker.ps1").EnvironmentVariables;
+            Check(env["HTTPS_PROXY"] == "http://127.0.0.1:3067" && env["NODE_EXTRA_CA_CERTS"] == "C:\\ca.pem", "proxy and CA variables reach the worker");
+        } finally { Environment.SetEnvironmentVariable("HTTPS_PROXY", null); Environment.SetEnvironmentVariable("NODE_EXTRA_CA_CERTS", null); }
+
+        File.WriteAllText(catalogPath, "{\"providers\":[{\"id\":\"gwarden\",\"label\":\"GWarden\",\"endpoint\":\"https://gwarden.su/v1\",\"model\":\"glm-5.3\"},{\"id\":\"custom\",\"label\":\"Другой\"}]}");
+        try { using (var form = new InstallerForm()) {
+            typeof(InstallerForm).GetField("result", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+                .SetValue(form, new Outcome { Success = true, LaunchPath = "C:\\nowhere\\Hermes.exe", LaunchArgs = new string[0] });
+            form.GoTo(InstallerForm.PageDone);
+            form.TryLaunch();
+            Check(form.LaunchNote.Contains("карантин") && form.LaunchNote.Contains("C:\\nowhere\\Hermes.exe"), "a failed launch is explained on Done: antivirus quarantine and the exe path");
+            Check(form.Launch.Enabled, "«Открыть Hermes» stays enabled after a failed launch");
+            form.ShowTelegramStep("my_bot", true);
+            var text = (System.Windows.Forms.Label)form.Controls.Find("TelegramStepText", true)[0];
+            Check(text.Text.Contains("автозапуск бота после перезагрузки не настроен"), "a missing bot autostart is said on the Done screen");
+            form.ShowTelegramStep("my_bot", false);
+            Check(!text.Text.Contains("автозапуск"), "no autostart line when autostart is set");
+            var interrupted = Status("ours_completed", true, true, "0.1.3"); interrupted.ChangeInterrupted = true;
+            form.ApplyStatus(interrupted);
+            Check(form.MaintenanceNote.Contains("смена провайдера была прервана") && form.PrimaryMaintenanceAction == "Сменить провайдера или ключ", "an interrupted provider change is offered again, with a note");
+        }} finally { File.Delete(catalogPath); }
+    }
+
+    // --- maintenance: the "status" record, the "done" record, the requests -----------------
+    public static string StatusLine(string state, string extra)
+    {
+        return "{\"type\":\"status\",\"message\":\"m\",\"state\":\"" + state + "\",\"launch_path\":\"\",\"set_supported\":true," +
+            "\"set_version\":\"0.1.2\",\"package_set_version\":\"0.1.3\",\"model_ours\":true,\"base_url\":\"https://gwarden.su/v1\"," +
+            "\"model\":\"glm-5.3\",\"telegram\":false,\"backups\":1,\"change_interrupted\":false" + extra + "}";
+    }
+    static Protocol StatusProtocol() { return new Protocol(null, delegate { }, delegate { return false; }) { StatusMode = true }; }
+    static Protocol MaintProtocol() { return new Protocol(null, delegate { }, delegate { return false; }) { MaintenanceMode = true }; }
+    static void MaintenanceProtocolTests()
+    {
+        var st = StatusProtocol(); st.Feed(StatusLine("ours_completed", ""));
+        var s = st.Finish(0);
+        Check(s.Success && s.Status != null && s.Status.State == "ours_completed" && s.Status.BaseUrl == "https://gwarden.su/v1" && s.Status.Model == "glm-5.3" &&
+              s.Status.Backups == 1 && !s.Status.Telegram && s.Status.SetSupported && s.Status.ModelOurs && s.Status.ProviderHost == "gwarden.su", "status record parses every field");
+        Check(s.Status.UpdateAvailable, "0.1.2 installed, 0.1.3 shipped = update available");
+        foreach (string state in new[] { "none", "ours_incomplete", "foreign" })
+        { var p = StatusProtocol(); p.Feed(StatusLine(state, "")); Check(p.Finish(0).Status.State == state, "status state " + state + " accepted"); }
+        var install = New(null); install.Feed(StatusLine("ours_completed", ""));
+        Check(!install.Finish(0).Success, "a status record is a protocol violation in an install session");
+        var extra = StatusProtocol(); extra.Feed(StatusLine("ours_completed", ",\"api_key\":\"x\""));
+        Check(!extra.Finish(0).Success, "a status record with an extra field (e.g. a key) is rejected");
+        var bad = StatusProtocol(); bad.Feed(StatusLine("hacked", ""));
+        Check(!bad.Finish(0).Success, "unknown state rejected");
+        var http = StatusProtocol(); http.Feed(StatusLine("ours_completed", "").Replace("https://gwarden.su/v1", "http://gwarden.su/v1"));
+        Check(!http.Finish(0).Success, "non-https base_url rejected");
+        var cred = StatusProtocol(); cred.Feed(StatusLine("ours_completed", "").Replace("https://gwarden.su/v1", "https://u:p@gwarden.su/v1"));
+        Check(!cred.Finish(0).Success, "base_url with credentials rejected");
+        var ver = StatusProtocol(); ver.Feed(StatusLine("ours_completed", "").Replace("\"0.1.2\"", "\"1.2-beta\""));
+        Check(!ver.Finish(0).Success, "malformed set version rejected");
+        var launch = StatusProtocol(); launch.Feed(StatusLine("ours_completed", "").Replace("\"launch_path\":\"\"", "\"launch_path\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\""));
+        var launched = launch.Finish(0);
+        Check(launched.Success && launched.Status.LaunchPath == "", "a launch path LaunchPolicy rejects becomes «no launch», never a launch");
+        var twice = StatusProtocol(); twice.Feed(StatusLine("ours_completed", "")); twice.Feed(StatusLine("none", ""));
+        Check(!twice.Finish(0).Success, "a second terminal record rejects");
+        Check(new InstallStatus { SetVersion = "", PackageSetVersion = "0.1.3" }.UpdateAvailable, "no recorded set = update available");
+        Check(!new InstallStatus { SetVersion = "0.1.3", PackageSetVersion = "0.1.3" }.UpdateAvailable, "same set = no update");
+        Check(!new InstallStatus { SetVersion = "0.2", PackageSetVersion = "0.1.3" }.UpdateAvailable, "a newer installed set is not «updated» backwards");
+        Check(!new InstallStatus { SetVersion = "", PackageSetVersion = "" }.UpdateAvailable, "unknown package set = no update offer");
+
+        var done = MaintProtocol(); done.Feed("{\"type\":\"progress\",\"message\":\"шаг\"}"); done.Feed("{\"type\":\"done\",\"status\":\"ok\",\"message\":\"Набор обновлён.\"}");
+        var d = done.Finish(0);
+        Check(d.Success && d.MaintenanceStatus == "ok" && d.Message == "Набор обновлён." && d.TelegramBot == null, "done record ends a maintenance session");
+        var partial = MaintProtocol(); partial.Feed("{\"type\":\"done\",\"status\":\"partial\",\"message\":\"не полностью\"}");
+        Check(partial.Finish(0).MaintenanceStatus == "partial", "done partial parsed");
+        var bot = MaintProtocol(); bot.Feed("{\"type\":\"done\",\"status\":\"ok\",\"message\":\"x\",\"telegram_bot\":\"my_bot\"}");
+        Check(bot.Finish(0).TelegramBot == "my_bot", "done carries a connected bot name");
+        var badBot = MaintProtocol(); badBot.Feed("{\"type\":\"done\",\"status\":\"ok\",\"message\":\"x\",\"telegram_bot\":\"a b\"}");
+        Check(!badBot.Finish(0).Success, "malformed bot name rejected");
+        var badStatus = MaintProtocol(); badStatus.Feed("{\"type\":\"done\",\"status\":\"great\",\"message\":\"x\"}");
+        Check(!badStatus.Finish(0).Success, "unknown done status rejected");
+        var inInstall = New(null); inInstall.Feed("{\"type\":\"done\",\"status\":\"ok\",\"message\":\"x\"}");
+        Check(!inInstall.Finish(0).Success, "done is a protocol violation in an install session");
+        var succ = MaintProtocol(); succ.Feed(SuccessLine("C:\\x\\hermes.exe"));
+        Check(!succ.Finish(0).Success, "an install success is a protocol violation in a maintenance session");
+        var err = MaintProtocol(); err.Feed("{\"type\":\"error\",\"code\":\"AUTH\",\"message\":\"ключ отклонён\"}");
+        Check(err.Finish(1).Code == "AUTH", "maintenance errors keep their protocol code");
+
+        var ser = new System.Web.Script.Serialization.JavaScriptSerializer();
+        foreach (string a in new[] { MaintenanceRequest.UpdateSet, MaintenanceRequest.ForeignAddSet })
+        {
+            var r = new MaintenanceRequest { Action = a };
+            Check(r.Validate() == null && ser.Serialize(r.Payload()) == "{\"protocol\":1,\"action\":\"" + a + "\"}", a + ": payload is protocol+action only");
+        }
+        var change = new MaintenanceRequest { Action = MaintenanceRequest.ChangeProvider, Provider = new Request { endpoint = " gwarden.su/v1 ", api_key = "NEW KEY 12345", model = "glm-5.3", telegram_bot_token = "1:x", fallbacks = new System.Collections.Generic.List<FallbackEntry> { new FallbackEntry() } } };
+        Check(change.Validate() == null, "change_provider validates like an install (token/backups dropped)");
+        var cp = change.Payload();
+        Check(cp.Count == 5 && (string)cp["endpoint"] == "https://gwarden.su/v1" && (string)cp["api_key"] == "NEWKEY12345" && (string)cp["model"] == "glm-5.3" && (string)cp["action"] == "change_provider" && !cp.ContainsKey("telegram_bot_token") && !cp.ContainsKey("fallbacks"),
+              "change_provider payload: normalized endpoint, cleaned key, model; nothing else");
+        Check(Array.IndexOf(change.Secrets(), "NEWKEY12345") >= 0, "the new key is redacted from worker text");
+        change.ClearSecrets();
+        Check(change.Provider.api_key == null, "ClearSecrets drops the new key");
+        Check(new MaintenanceRequest { Action = MaintenanceRequest.ChangeProvider, Provider = new Request { endpoint = "http://x/v1", api_key = "KEY12345678" } }.Validate() != null, "change_provider rejects http");
+        var tg = new MaintenanceRequest { Action = MaintenanceRequest.TelegramConnect, TelegramToken = " 123456789:" + new string('A', 35) + " " };
+        Check(tg.Validate() == null && ((string)tg.Payload()["telegram_bot_token"]).StartsWith("123456789:") && tg.Payload().Count == 3, "telegram_connect: cleaned token, protocol+action+token only");
+        Check(new MaintenanceRequest { Action = MaintenanceRequest.TelegramConnect, TelegramToken = "" }.Validate() != null, "telegram_connect requires a token");
+        Check(new MaintenanceRequest { Action = MaintenanceRequest.TelegramConnect, TelegramToken = "not-a-token" }.Validate() != null, "telegram_connect rejects a malformed token");
+        var backups = new MaintenanceRequest { Action = MaintenanceRequest.AddBackups, PrimaryEndpoint = "https://gwarden.su/v1",
+            Fallbacks = new System.Collections.Generic.List<FallbackEntry> { new FallbackEntry { provider_id = "dahl", endpoint = "https://dahl.test/v1", model = "m", api_key = "BACKUPKEY1" } } };
+        Check(backups.Validate() == null && backups.Payload().Count == 3 && backups.Payload().ContainsKey("fallbacks"), "add_backups: protocol+action+fallbacks only");
+        Check(new MaintenanceRequest { Action = MaintenanceRequest.AddBackups, PrimaryEndpoint = "https://dahl.test/v1", Fallbacks = backups.Fallbacks }.Validate() != null, "add_backups never adds the current primary as a backup");
+        Check(new MaintenanceRequest { Action = MaintenanceRequest.AddBackups, Fallbacks = new System.Collections.Generic.List<FallbackEntry>() }.Validate() != null, "add_backups with no entries rejected");
+        Check(new MaintenanceRequest { Action = "install" }.Validate() != null, "unknown maintenance action rejected");
+    }
+
+    static InstallStatus Status(string state, bool supported, bool modelOurs, string setVersion)
+    {
+        return new InstallStatus { State = state, Message = "Найден Hermes.", SetSupported = supported, ModelOurs = modelOurs, SetVersion = setVersion, PackageSetVersion = "0.1.3",
+            BaseUrl = modelOurs ? "https://gwarden.su/v1" : "", Model = modelOurs ? "glm-5.3" : "", Telegram = false, Backups = 0, LaunchPath = "" };
+    }
+    static void MaintenanceScreenTests(string catalogPath)
+    {
+        File.WriteAllText(catalogPath, "{\"providers\":[" +
+            "{\"id\":\"gwarden\",\"label\":\"GWarden\",\"endpoint\":\"https://gwarden.su/v1\",\"model\":\"glm-5.3\"}," +
+            "{\"id\":\"dahl\",\"label\":\"Dahl — бесплатно\",\"endpoint\":\"https://inference.dahl.global/v1\",\"model\":\"MiniMaxAI/MiniMax-M2.7\"}," +
+            "{\"id\":\"custom\",\"label\":\"Другой (точный адрес API)\"}]}");
+        try { using (var form = new InstallerForm()) {
+            form.ApplyStatus(Status("none", false, false, ""));
+            Check(form.PageIndex == InstallerForm.PageChoose && form.Installed == null, "fresh computer: the wizard is unchanged");
+            form.ApplyStatus(Status("ours_incomplete", false, false, ""));
+            Check(form.PageIndex == InstallerForm.PageChoose && form.Installed == null, "an unfinished install of ours keeps the resume wizard");
+
+            form.SelectProvider(1);
+            form.ApplyStatus(Status("ours_completed", true, true, "0.1.2")); form.GoTo(InstallerForm.PageMaintain);
+            Check(form.MaintenanceHeading == "Hermes уже установлен", "ours: «Hermes уже установлен»");
+            Check(String.Join("|", form.MaintenanceActions) == "Обновить набор|Подключить Телеграм|Запасные ключи|Сменить провайдера или ключ", "ours: update, Telegram, backups, change provider");
+            Check(form.PrimaryMaintenanceAction == "Обновить набор", "a newer set makes «Обновить набор» the recommended action");
+            Check(form.MaintenanceSummary.Contains("gwarden.su") && form.MaintenanceSummary.Contains("glm-5.3") && form.MaintenanceSummary.Contains("обновление до 0.1.3"), "summary names the provider, model and the available update");
+            Check(form.SelectedProvider == 0, "the provider screen starts on the installed provider");
+            var names = new System.Collections.Generic.List<string>();
+            foreach (var p in form.MaintenanceBackupCandidates()) names.Add(p.id);
+            Check(String.Join(",", names.ToArray()) == "dahl", "backup candidates exclude the installed primary and «Другой»");
+            using (var d = form.CreateMaintenanceBackupDialog())
+            {
+                d.Keys[0].Text = "BACKUP KEY 111";
+                Check(d.TryAccept() == null, "the backup dialog accepts a key on an installed Hermes");
+                var br = form.BuildBackupRequest(d);
+                Check(br != null && br.Action == "add_backups" && br.Validate() == null && br.Fallbacks.Count == 1 && br.Fallbacks[0].api_key == "BACKUPKEY111" && br.PrimaryEndpoint == "https://gwarden.su/v1", "the dialog result becomes an add_backups request");
+            }
+
+            form.ShowTelegramEntry(true);
+            Check(form.TelegramEntryShown, "«Подключить Телеграм» opens the token entry");
+            form.ShowTelegramEntry(false);
+            Check(!form.TelegramEntryShown, "«Отмена» closes it");
+
+            form.BeginChangeProvider();
+            Check(form.IsChangeMode && form.PageIndex == InstallerForm.PageChoose && form.Next.Text == "Далее", "«Сменить провайдера или ключ» opens the provider screen");
+            form.GoTo(InstallerForm.PageKey);
+            Check(form.Next.Text == "Сохранить" && !form.TelegramShown, "the key screen saves instead of installing; no Telegram field in a provider change");
+            form.GoTo(InstallerForm.PageChoose);
+            form.LeaveChangeMode();
+            Check(!form.IsChangeMode && form.PageIndex == InstallerForm.PageMaintain, "«Назад» from the provider screen returns to the maintenance screen");
+
+            form.ApplyStatus(Status("ours_completed", true, false, "0.1.3"));
+            Check(Array.IndexOf(form.MaintenanceActions, "Сменить провайдера или ключ") < 0 && form.MaintenanceNote.Contains("вне установщика"), "a model block changed outside the installer is never offered for replacement");
+            Check(form.PrimaryMaintenanceAction == null, "an up-to-date set recommends nothing");
+            var connected = Status("ours_completed", true, true, "0.1.3"); connected.Telegram = true;
+            form.ApplyStatus(connected);
+            Check(Array.IndexOf(form.MaintenanceActions, "Подтвердить Телеграм") >= 0, "a connected bot offers the owner confirmation instead of a new token");
+            form.OpenTelegramApproval(null);
+            Check(form.PageIndex == InstallerForm.PageDone, "the Done-screen approval block is reused");
+
+            form.ApplyStatus(Status("foreign", true, false, ""));
+            Check(form.MaintenanceHeading == "У вас уже есть Hermes" && form.MaintenanceSummary.Contains("Настройки модели и ключи не изменятся"), "foreign: our set is offered, model and keys untouched");
+            Check(String.Join("|", form.MaintenanceActions) == "Добавить набор|Подключить Телеграм|Запасные ключи", "foreign: add set, Telegram, backups; never a provider change");
+            Check(form.PrimaryMaintenanceAction == "Добавить набор", "foreign: «Добавить набор» is recommended");
+            form.ApplyStatus(Status("foreign", false, false, ""));
+            Check(form.MaintenanceActions.Length == 0 && form.MaintenanceNote.Contains("Python"), "foreign without a usable Python: nothing is offered, the reason is shown");
+        }} finally { File.Delete(catalogPath); }
     }
 
     // --- failure / stopped screen: two ways forward after ANY terminal outcome -------------

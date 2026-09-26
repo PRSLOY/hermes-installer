@@ -99,7 +99,11 @@ function Check-InstallResult($Result) {
             'node-deps'        = 'Не удалось установить Node.js-зависимости. Проверьте интернет и повторите.'
             'desktop'          = 'Не удалось собрать Desktop (загрузка компонентов). Проверьте интернет и повторите.'
         }
-        if ($r -match 'failed to download repository' -or $r -match 'rpc failed' -or $r -match 'early eof' -or $r -match 'etimedout' -or $r -match 'econnreset') {
+        # A certificate npm/uv/git cannot trust is almost always HTTPS scanning by an antivirus
+        # or a wrong system clock, not the network: say that, whatever the stage.
+        if ($r -match 'self.signed|unable to get local issuer|cert_has_expired') {
+            $advice = ' Антивирус проверяет защищённые соединения или сбиты дата и время. Проверьте часы; временно отключите проверку HTTPS в антивирусе и повторите.'
+        } elseif ($r -match 'failed to download repository' -or $r -match 'rpc failed' -or $r -match 'early eof' -or $r -match 'etimedout' -or $r -match 'econnreset') {
             $advice = ' Скачивание не удалось из-за сети. Проверьте интернет или VPN и повторите.'
         } elseif ($r -match 'git fetch') {
             $advice = ' Не удалось получить код Hermes из сети. Проверьте интернет/VPN и повторите.'
@@ -161,7 +165,7 @@ function Get-VcRedistResult([int]$ExitCode) {
     if ($ExitCode -in @(0, 3010, 1638)) { return 'installed' }
     return 'failed'
 }
-function Install-VcRuntime([string]$SystemDir = (Join-Path $env:WINDIR 'System32'), [int]$InstallSeconds = 600) {
+function Install-VcRuntime([string]$SystemDir = (Join-Path $env:WINDIR 'System32'), [int]$InstallSeconds = 600, [int]$PromptSeconds = 300) {
     if (Test-VcRuntime $SystemDir) { return 'present' }
     $dir = Join-Path ([IO.Path]::GetTempPath()) ('hermes-vcredist-' + [Guid]::NewGuid().ToString('N'))
     try {
@@ -183,35 +187,54 @@ function Install-VcRuntime([string]$SystemDir = (Join-Path $env:WINDIR 'System32
         $size = (Get-Item -LiteralPath $file).Length
         if ($size -lt 5MB -or $size -gt 100MB) { return 'signature' }
         if (-not (Test-MicrosoftSignature (Get-AuthenticodeSignature -LiteralPath $file))) { return 'signature' }
+        # The UAC prompt blocks Start-Process until it is answered, and an unanswered prompt
+        # (behind other windows, blinking on the taskbar) would hold the install forever. The
+        # elevation runs in a job: prompt + install share one bound, then the step gives up.
+        $job = Start-Job -ScriptBlock {
+            param($file, $ms)
+            try {
+                $p = Start-Process -FilePath $file -ArgumentList '/install','/quiet','/norestart' -Verb RunAs -PassThru -WindowStyle Hidden -ErrorAction Stop
+            } catch { return 'declined' }   # UAC "No" -> Win32 1223 "canceled by the user"
+            if (-not $p.WaitForExit($ms)) { return 'timeout' }
+            return [string]$p.ExitCode
+        } -ArgumentList $file, ($InstallSeconds * 1000)
         try {
-            $p = Start-Process -FilePath $file -ArgumentList '/install','/quiet','/norestart' -Verb RunAs -PassThru -WindowStyle Hidden
-        } catch { return 'declined' }   # UAC "No" -> Win32 1223 "canceled by the user"
-        if (-not $p.WaitForExit($InstallSeconds * 1000)) { return 'failed' }
-        if ((Get-VcRedistResult $p.ExitCode) -ne 'installed') { return 'failed' }
+            $done = Wait-Job -Job $job -Timeout ($InstallSeconds + $PromptSeconds)
+            $answer = if ($done) { [string](@(Receive-Job -Job $job) | Select-Object -Last 1) } else { 'unanswered' }
+        } finally { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+        if ($answer -ceq 'declined' -or $answer -ceq 'unanswered') { return 'declined' }
+        $exit = 0
+        if (-not [int]::TryParse($answer, [ref]$exit)) { return 'failed' }
+        if ((Get-VcRedistResult $exit) -ne 'installed') { return 'failed' }
         if (-not (Test-VcRuntime $SystemDir)) { return 'failed' }
         return 'installed'
     } catch { return 'failed' }
     finally { try { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction Stop } catch { } }
 }
 $script:VcRuntimeText = @{
-    'start'     = 'Включаю распознавание голоса: Windows попросит разрешение на установку компонента Microsoft Visual C++.'
+    'start'     = 'Включаю распознавание голоса: подтвердите запрос Windows на установку компонента Microsoft Visual C++ — если окна не видно, он может мигать на панели задач. Без ответа установка продолжится через 5 минут без голоса.'
     'installed' = 'Распознавание голосовых сообщений включено.'
     'declined'  = 'Распознавание голоса не включено: установка компонента Microsoft отменена; Hermes работает.'
     'network'   = 'Распознавание голоса не включено: не удалось скачать компонент Microsoft; Hermes работает.'
     'signature' = 'Распознавание голоса не включено: файл компонента не прошёл проверку подписи Microsoft; Hermes работает.'
     'failed'    = 'Распознавание голоса не включено: установщик компонента Microsoft завершился с ошибкой; Hermes работает.'
 }
-function Invoke-TelegramAction([string]$Action, $InputData, [string]$HomeDir, [string]$Repo, [string]$Python, [string]$Pin, [string]$Sid, [string]$Journal) {
-    # Only a home this installer completed: never touch a foreign or half-done Hermes.
-    if (-not (Test-Path -LiteralPath $Journal) -or -not (Test-Path -LiteralPath $Python -PathType Leaf)) { Fail 'CONFIG' 'Hermes не установлен этим установщиком. Телеграм здесь не настраивается.' }
-    $state = Read-Journal $HomeDir $Repo $Pin $Sid
-    if ($state.phase -ne 'completed') { Fail 'CONFIG' 'Установка Hermes не завершена. Сначала завершите установку.' }
+function Invoke-TelegramAction([string]$Action, $InputData, $Target) {
+    # A home this installer completed (any package revision), or an existing Hermes the
+    # maintenance screen serves (Resolve-Target 'foreign' with its own Python). Never a
+    # half-done install of ours. The owner's click is still required for every approval.
+    $state = $Target.journal
+    if ($Target.state -cne 'foreign' -and ($null -eq $state -or $state.phase -ne 'completed')) {
+        if ($null -eq $state) { Fail 'CONFIG' 'Hermes не установлен этим установщиком. Телеграм здесь не настраивается.' }
+        Fail 'CONFIG' 'Установка Hermes не завершена. Сначала завершите установку.'
+    }
+    if (-not $Target.python) { Fail 'CONFIG' 'Не найден Python установленного Hermes. Телеграм здесь не настраивается.' }
     $mode = if ($Action -ceq 'telegram_approve') { 'approve' } else { 'pending' }
     $payload = if ($mode -eq 'approve') { @{request_id=[string]$InputData.request_id; user_id=[string]$InputData.user_id} | ConvertTo-Json -Compress } else { '{}' }
     $status = 'failed'; $requests = @()
     try {
         # approve = pairing approve + home channel + gateway restart + connected wait (<= ~4 min).
-        $child = Run-Child $Python @((Join-Path $PSScriptRoot 'telegram.py'),$HomeDir,$Repo,$mode) $payload 300
+        $child = Run-Child $Target.python @((Join-Path $PSScriptRoot 'telegram.py'),$Target.home,$Target.repo,$mode) $payload 300
         $last = @($child.Text -split "`n" | Where-Object { $_.Trim() })[-1]
         $reply = $last | ConvertFrom-Json
         $allowed = if ($mode -eq 'approve') { @('approved','approved_partial','expired','off','failed') } else { @('pending','none','done','off','failed') }
@@ -277,6 +300,142 @@ $script:FallbackText = @{
     'verify'  = 'API провайдера ответил некорректно'
     'failed'  = 'не удалось сохранить настройку'
 }
+# --- Steps shared by the install and the maintenance screen --------------------
+# Never terminal: fixed Russian lines only; child output is inspected, never relayed.
+
+# Out-of-box set: SOUL, skills, keyless MCP catalogs, retunes (extras.py), then the
+# marketplaces search MCP (ru-marketplace-mcp) with its own step and budget, since the
+# pinned archive download plus uv sync (Python 3.12 + deps) can take minutes.
+# Returns @{set=<extras ok>; marketplaces='added'|'exists'|'failed'}.
+function Invoke-SetSteps([string]$Python, [string]$HomeDir, [string]$Repo) {
+    Send-Event @{type='progress';message='Настраиваю набор: личность помощника, первые шаги, калькулятор и справочники…'}
+    $extraOk = $false
+    try {
+        $script:ChildLabel = 'Настройка набора'
+        $extra = Run-Child $Python @((Join-Path $PSScriptRoot 'extras.py'),$HomeDir,$Repo,(Join-Path $PSScriptRoot 'assets')) '' 180
+        if ($extra.Code -eq 0) {
+            try { $extraOk = (($extra.Text | ConvertFrom-Json).ok -eq $true) } catch { $extraOk = $false }
+        }
+    } catch { $extraOk = $false }
+    if (-not $extraOk) { Send-Event @{type='progress';message='Набор настроен не полностью; Hermes работает.'} }
+    Send-Event @{type='progress';message='Подключаю поиск по маркетплейсам…'}
+    $mpStatus = 'failed'
+    try {
+        $script:ChildLabel = 'Поиск по маркетплейсам'
+        $mp = Run-Child $Python @((Join-Path $PSScriptRoot 'extras.py'),$HomeDir,$Repo,(Join-Path $PSScriptRoot 'assets'),'--marketplaces') '' 900
+        if ($mp.Code -eq 0) {
+            try { $mpStatus = [string](($mp.Text | ConvertFrom-Json).marketplaces) } catch { $mpStatus = 'failed' }
+        }
+    } catch { $mpStatus = 'failed' }
+    $mpText = @{
+        'added'  = 'Поиск по маркетплейсам подключён: Ozon, Авито, Яндекс Маркет, Детский мир.'
+        'exists' = 'Поиск по маркетплейсам уже был подключён.'
+        'failed' = 'Поиск по маркетплейсам не подключён; Hermes работает.'
+    }
+    if (-not $mpText.ContainsKey($mpStatus)) { $mpStatus = 'failed' }
+    Send-Event @{type='progress';message=$mpText[$mpStatus]}
+    return @{set=$extraOk; marketplaces=$mpStatus}
+}
+# Optional backup providers (issue #10): Hermes' own fallback_providers chain. Keys
+# travel on stdin to fallbacks.py only and are dropped right after. -Replace (maintenance)
+# lets a backup of ours take a new key. Returns @{note; done; total; problems}.
+function Invoke-Fallbacks([string]$Python, [string]$HomeDir, [object[]]$Entries, [switch]$Replace) {
+    Send-Event @{type='progress';message='Подключаю запасных провайдеров…'}
+    $fbTotal = $Entries.Count
+    $fbStatuses = @('failed') * $fbTotal
+    $fbInput = $null; $request = $null
+    try {
+        $script:ChildLabel = 'Запасные провайдеры'
+        $request = @{fallbacks=[object[]]$Entries}
+        if ($Replace) { $request['replace'] = $true }
+        $fbInput = $request | ConvertTo-Json -Compress -Depth 6
+        # Up to 3 live checks of 3 x 45 s transport attempts each, plus the writes.
+        $fb = Run-Child $Python @((Join-Path $PSScriptRoot 'fallbacks.py'),$HomeDir) $fbInput 600
+        $fbLast = @($fb.Text -split "`n" | Where-Object { $_.Trim() })[-1]
+        $fbResults = @(($fbLast | ConvertFrom-Json).results)
+        for ($i = 0; $i -lt $fbTotal -and $i -lt $fbResults.Count; $i++) {
+            $s = [string]$fbResults[$i].status
+            if ($s -cin @('added','exists','replaced') -or $script:FallbackText.ContainsKey($s)) { $fbStatuses[$i] = $s }
+        }
+    } catch { }
+    $fbInput = $null; $request = $null; $Entries = $null
+    $fbDone = 0; $problems = @()
+    for ($i = 0; $i -lt $fbTotal; $i++) {
+        if ($fbStatuses[$i] -cin @('added','exists','replaced')) { $fbDone++ }
+        else {
+            $line = 'Запасной провайдер ' + ($i + 1) + ' не подключён: ' + $script:FallbackText[$fbStatuses[$i]] + '.'
+            $problems += $line
+            Send-Event @{type='progress';message=$line}
+        }
+    }
+    $fallbackNote = "Запасные провайдеры: подключено $fbDone из $fbTotal."
+    Send-Event @{type='progress';message=$fallbackNote}
+    return @{note=$fallbackNote; done=$fbDone; total=$fbTotal; problems=$problems}
+}
+# Voice input (local faster-whisper) needs the VC++ runtime: Telegram voice notes AND the
+# Desktop microphone, so the install runs this with or without a bot token, before the
+# Telegram step. Present = silent (the common case; UAC only on clean Windows).
+function Invoke-VcStep {
+    try {
+        if (-not (Test-VcRuntime)) {
+            Send-Event @{type='progress';message=$script:VcRuntimeText['start']}
+            $vc = Install-VcRuntime
+            if ($vc -eq 'present') { $vc = 'installed' }
+            if (-not $script:VcRuntimeText.ContainsKey($vc) -or $vc -eq 'start') { $vc = 'failed' }
+            Send-Event @{type='progress';message=$script:VcRuntimeText[$vc]}
+        }
+    } catch { Send-Event @{type='progress';message=$script:VcRuntimeText['failed']} }
+}
+# Optional Telegram bot: one fixed Russian line on failure, child output parsed (last
+# line) and never relayed. Returns @{status; bot (name, '-' or $null when not connected); note}.
+function Invoke-TelegramConnect([string]$Python, [string]$HomeDir, [string]$Repo, [string]$telegramToken) {
+    $telegramNote = ''
+    Send-Event @{type='progress';message='Подключаю вашего Телеграм-бота…'}
+    $tgStatus = 'failed'; $tgBot = ''; $tgAutostart = $false
+    try {
+        $script:ChildLabel = 'Подключение Телеграма'
+        $tg = Run-Child $Python @((Join-Path $PSScriptRoot 'telegram.py'),$HomeDir,$Repo) (@{telegram_bot_token=$telegramToken} | ConvertTo-Json -Compress) 600
+        $tgLast = @($tg.Text -split "`n" | Where-Object { $_.Trim() })[-1]
+        $tgReply = $tgLast | ConvertFrom-Json
+        if ([string]$tgReply.status -cin @('connected','token','network','exists','open','saved','failed')) { $tgStatus = [string]$tgReply.status }
+        if ($tgStatus -eq 'connected' -and ($tg.Code -ne 0 -or $tgReply.ok -ne $true)) { $tgStatus = 'failed' }
+        if ($tgReply.bot -is [string] -and $tgReply.bot -cmatch '^[A-Za-z0-9_]{5,64}$') { $tgBot = ' @' + $tgReply.bot }
+        if ($tgStatus -eq 'connected' -and [string]$tgReply.autostart -cin @('task','startup')) { $tgAutostart = $true }
+    } catch { $tgStatus = 'failed' }
+    $telegramToken = $null
+    $tgText = @{
+        'connected' = "Телеграм подключён. Напишите вашему боту$tgBot любое сообщение и нажмите «Проверить» на этом экране."
+        'token'     = 'Телеграм не подключён: токен бота не принят. Hermes работает; проверьте токен у @BotFather и подключите бота позже в Hermes → «Сообщения».'
+        'network'   = 'Телеграм не подключён: нет связи с серверами Телеграм. Hermes работает; включите VPN и подключите бота позже в Hermes → «Сообщения».'
+        'exists'    = 'Телеграм не подключён: в Hermes уже настроен другой бот. Существующие настройки сохранены.'
+        'open'      = 'Телеграм не подключён: в настройках Hermes бот открыт для всех. Настройки не изменены.'
+        'saved'     = 'Телеграм-бот сохранён, но пока не запустился. Hermes работает; перезагрузите компьютер или откройте Hermes → «Сообщения» и перезапустите шлюз. Затем напишите боту и одобрите себя: Hermes → «Сообщения» → «Одобрить» (или откройте этот установщик снова — он предложит подтвердить Телеграм).'
+        'failed'    = 'Телеграм не подключён из-за ошибки. Hermes работает; подключите бота позже в Hermes → «Сообщения».'
+    }
+    if ($tgStatus -ne 'connected') { Send-Event @{type='progress';message=$tgText[$tgStatus]} }
+    $telegramNote = ' ' + $tgText[$tgStatus]
+    $telegramBot = $null
+    if ($tgStatus -eq 'connected') {
+        # The UI shows the owner-approval step only for a connected bot.
+        $telegramBot = if ($tgBot) { $tgBot.Trim().TrimStart('@') } else { '-' }
+        if (-not $tgAutostart) {
+            # gateway_windows.install may exit 0 without any login entry: say so, stay non-fatal.
+            $autostartLine = 'Бот работает сейчас, но автозапуск после перезагрузки не настроен: после перезагрузки откройте Hermes → «Сообщения» и запустите шлюз.'
+            Send-Event @{type='progress';message=$autostartLine}
+            $telegramNote += ' ' + $autostartLine
+        }
+    }
+    return @{status=$tgStatus; bot=$telegramBot; note=$telegramNote}
+}
+# Maintenance actions of the «Hermes уже установлен» screen and the stdin fields each accepts.
+$script:MaintenanceFields = @{
+    'status'           = @('protocol','action')
+    'update_set'       = @('protocol','action')
+    'foreign_add_set'  = @('protocol','action')
+    'change_provider'  = @('protocol','action','endpoint','api_key','model','provider_name')
+    'add_backups'      = @('protocol','action','fallbacks')
+    'telegram_connect' = @('protocol','action','telegram_bot_token')
+}
 function Main {
     $mutex = $null; $locked = $false; $fallbackEntries = @()
     try {
@@ -287,18 +446,22 @@ function Main {
             $raw = [Console]::In.ReadToEnd().TrimStart([char]0xFEFF)
             if ($raw.Length -gt 32768) { throw 'size' }
             $inputData = $raw | ConvertFrom-Json
-            $telegramAction = $null
+            $telegramAction = $null; $maintenance = $null
             if ($inputData.protocol -eq 1 -and $inputData.action -cin @('telegram_pending','telegram_approve')) {
                 # Short post-install actions (Done screen). No key, endpoint or token travels here.
                 $telegramAction = [string]$inputData.action
                 $allowedFields = if ($telegramAction -ceq 'telegram_approve') { @('protocol','action','request_id','user_id') } else { @('protocol','action') }
                 foreach ($name in @($inputData.PSObject.Properties.Name)) { if ($name -cnotin $allowedFields) { throw 'field' } }
                 if ($telegramAction -ceq 'telegram_approve' -and ($inputData.request_id -isnot [string] -or $inputData.request_id -cnotmatch '^[0-9a-f]{16}$' -or $inputData.user_id -isnot [string] -or $inputData.user_id -cnotmatch '^[0-9]{1,20}$')) { throw 'request' }
+            } elseif ($inputData.protocol -eq 1 -and $inputData.action -is [string] -and $inputData.action -cin @($script:MaintenanceFields.Keys)) {
+                $maintenance = [string]$inputData.action
+                foreach ($name in @($inputData.PSObject.Properties.Name)) { if ($name -cnotin $script:MaintenanceFields[$maintenance]) { throw 'field' } }
             }
         } catch { Fail 'INPUT' 'Проверьте данные: точный HTTPS-адрес API, API-ключ, необязательное имя модели, токен Телеграм-бота и запасные ключи.' }
         try {
-          if (-not $telegramAction) {
-            if ($inputData.protocol -ne 1 -or $inputData.action -cne 'install') { throw 'protocol' }
+          $install = -not $telegramAction -and -not $maintenance
+          if ($install -and ($inputData.protocol -ne 1 -or $inputData.action -cne 'install')) { throw 'protocol' }
+          if ($install -or $maintenance -ceq 'change_provider') {
             if ($inputData.endpoint -isnot [string] -or $inputData.api_key -isnot [string]) { throw 'types' }
             $uri = [Uri]$inputData.endpoint
             if (-not $uri.IsAbsoluteUri -or $uri.Scheme -cne 'https' -or -not $uri.Host -or $uri.UserInfo -or $uri.Query -or $uri.Fragment) { throw 'url' }
@@ -307,10 +470,16 @@ function Main {
                 $value = $inputData.$field
                 if ($null -ne $value -and ($value -isnot [string] -or $value.Length -gt 256 -or $value -match '[\x00-\x1F]')) { throw 'field' }
             }
+          }
+          if ($install -or $maintenance -ceq 'telegram_connect') {
             # Optional Telegram bot token: absent/empty = skipped; otherwise digits:secret.
             $tgValue = $inputData.telegram_bot_token
             if ($null -ne $tgValue -and ($tgValue -isnot [string] -or ($tgValue.Length -gt 0 -and $tgValue -cnotmatch '^[0-9]{1,20}:[A-Za-z0-9_-]{30,64}$'))) { throw 'telegram' }
+            if ($maintenance -and -not $tgValue) { throw 'telegram' }
+          }
+          if ($install -or $maintenance -ceq 'add_backups') {
             $fallbackEntries = @(Get-FallbackEntries $inputData)
+            if ($maintenance -and $fallbackEntries.Count -eq 0) { throw 'fallbacks' }
           }
         } catch { Fail 'INPUT' 'Проверьте данные: точный HTTPS-адрес API, API-ключ, необязательное имя модели, токен Телеграм-бота и запасные ключи.' }
         # The bot token goes only to telegram.py; configure.py never sees it.
@@ -320,10 +489,19 @@ function Main {
         # Backup keys go only to fallbacks.py (after the primary is verified); never to configure.py.
         $inputData.PSObject.Properties.Remove('fallbacks')
         $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        $mutex = New-Object Threading.Mutex($false, "Local\HermesSubscriberSetup-$sid")
-        try { $locked = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $locked = $true }
-        if (-not $locked) { Fail 'BUSY' 'Другая установка уже выполняется. Дождитесь её завершения.' }
+        # «status» only reads: it never waits for or blocks another run.
+        if ($maintenance -cne 'status') {
+            $mutex = New-Object Threading.Mutex($false, "Local\HermesSubscriberSetup-$sid")
+            try { $locked = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $locked = $true }
+            if (-not $locked) { Fail 'BUSY' 'Другая установка уже выполняется. Дождитесь её завершения.' }
+        }
         if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitOperatingSystem) { Fail 'UNSUPPORTED' 'Нужна 64-разрядная Windows 10/11.' }
+        if ($telegramAction -or $maintenance) {
+            $pin = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'upstream\commit.txt') -Raw).Trim()
+            $target = Resolve-Target $pin $sid
+            if ($telegramAction) { return (Invoke-TelegramAction $telegramAction $inputData $target) }
+            return (Invoke-Maintenance $maintenance $inputData $target $fallbackEntries $telegramToken)
+        }
         $homeDir = Join-Path $env:LOCALAPPDATA 'hermes'
         if ($env:HERMES_HOME -and [IO.Path]::GetFullPath($env:HERMES_HOME).TrimEnd('\') -ine [IO.Path]::GetFullPath($homeDir).TrimEnd('\')) {
             Fail 'CONFIG' 'Обнаружен нестандартный профиль Hermes. Чтобы его не повредить, автоматическая настройка остановлена.'
@@ -334,12 +512,19 @@ function Main {
         $homeDir=Assert-SafePath $homeDir; $repo=Assert-SafePath $repo
         $pin = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'upstream\commit.txt') -Raw).Trim()
         $journal=Journal-Path $homeDir; $null=Assert-SafePath $journal
-        if ($telegramAction) { return (Invoke-TelegramAction $telegramAction $inputData $homeDir $repo $python $pin $sid $journal) }
         $fresh = -not (Test-Path -LiteralPath $homeDir)
         $resume=$false
         if (Test-Path -LiteralPath $journal) {
-            $state=Read-Journal $homeDir $repo $pin $sid
-            if ($state.phase -eq 'installing') { Preserve-IncompleteInstall $state; $resume=$true }
+            # Owner, Windows user, home and repo must match; the pin may be an earlier package's.
+            $state=Read-Journal $homeDir $repo $pin $sid -AnyRevision
+            if ($state.phase -eq 'completed' -and -not $fresh) { Fail 'CONFIG' 'Hermes уже установлен. Закройте и снова откройте установщик: он предложит обновить набор, сменить ключ или подключить Телеграм.' }
+            # Not finished and not reusable as is: an earlier package's pin, a home deleted to
+            # «start over», or files changed since the snapshot (e.g. an antivirus quarantined
+            # Hermes.exe). Parked aside untouched and reinstalled; Preserve-IncompleteInstall
+            # still refuses when settings or a key are present, so nothing of the person's moves.
+            $park = $fresh -or $state.phase -eq 'installing' -or $state.revision -cne $pin
+            if (-not $park) { $park = ((Journal-Fingerprints $homeDir $repo) -join ',') -cne ($state.fingerprints -join ',') }
+            if ($park) { Preserve-IncompleteInstall $state; $resume=$true }
         }
         if ($resume -or ($fresh -and -not (Test-Path -LiteralPath $journal))) {
             if ($pin -notmatch '^[0-9a-f]{40}$') { Fail 'INSTALL' 'Некорректная версия пакета.' }
@@ -421,123 +606,25 @@ function Main {
         # set, so a kill during the up-to-180 s set step cannot leave the journal
         # in 'configuring' (review 2026-09-22). The success event still comes last.
         $state.phase='completed'; Write-Journal $state
-        # Out-of-box set: SOUL, first-step skill, keyless MCP catalogs. A failure
-        # here is never terminal -- one warning line, the verified success stands.
-        # Child output is inspected, never relayed; the step owns its own try/catch.
-        Send-Event @{type='progress';message='Настраиваю набор: личность помощника, первые шаги, калькулятор и справочники…'}
-        try {
-            $script:ChildLabel = 'Настройка набора'
-            $extra = Run-Child $python @((Join-Path $PSScriptRoot 'extras.py'),$homeDir,$repo,(Join-Path $PSScriptRoot 'assets')) '' 180
-            $extraOk = $false
-            if ($extra.Code -eq 0) {
-                try { $extraOk = (($extra.Text | ConvertFrom-Json).ok -eq $true) } catch { $extraOk = $false }
-            }
-            if (-not $extraOk) { Send-Event @{type='progress';message='Набор настроен не полностью; Hermes работает.'} }
-        } catch {
-            Send-Event @{type='progress';message='Набор настроен не полностью; Hermes работает.'}
-        }
-        # Marketplaces search MCP (ru-marketplace-mcp): its own step and budget, since
-        # the pinned archive download plus uv sync (Python 3.12 + deps) can take
-        # minutes on a slow line. Same contract as the set: never terminal, fixed lines.
-        Send-Event @{type='progress';message='Подключаю поиск по маркетплейсам…'}
-        $mpStatus = 'failed'
-        try {
-            $script:ChildLabel = 'Поиск по маркетплейсам'
-            $mp = Run-Child $python @((Join-Path $PSScriptRoot 'extras.py'),$homeDir,$repo,(Join-Path $PSScriptRoot 'assets'),'--marketplaces') '' 900
-            if ($mp.Code -eq 0) {
-                try { $mpStatus = [string](($mp.Text | ConvertFrom-Json).marketplaces) } catch { $mpStatus = 'failed' }
-            }
-        } catch { $mpStatus = 'failed' }
-        $mpText = @{
-            'added'  = 'Поиск по маркетплейсам подключён: Ozon, Авито, Яндекс Маркет, Детский мир.'
-            'exists' = 'Поиск по маркетплейсам уже был подключён.'
-            'failed' = 'Поиск по маркетплейсам не подключён; Hermes работает.'
-        }
-        if (-not $mpText.ContainsKey($mpStatus)) { $mpStatus = 'failed' }
-        Send-Event @{type='progress';message=$mpText[$mpStatus]}
-        # Optional backup providers (issue #10): Hermes' own fallback_providers chain.
-        # Only after the primary is verified and the set ran; never terminal. Keys
-        # travel on stdin to fallbacks.py only and are dropped right after; its
-        # statuses map to fixed Russian lines, no provider text is relayed.
+        # Tells the UI the install itself is done: a Cancel or hung-worker stop during the
+        # optional steps below then ends on the Done screen, not on a failed «Повторить».
+        Send-Event @{type='configured';message='Ключ проверен, настройки сохранены. Остались необязательные шаги.';launch_path=$desktopExe}
+        # Out-of-box set, then backups, voice and Telegram: each optional, never terminal;
+        # the verified success stands whatever they report.
+        $null = Invoke-SetSteps $python $homeDir $repo
         $fallbackNote = ''
         if ($fallbackEntries.Count -gt 0) {
-            Send-Event @{type='progress';message='Подключаю запасных провайдеров…'}
-            $fbTotal = $fallbackEntries.Count
-            $fbStatuses = @('failed') * $fbTotal
-            $fbInput = $null
-            try {
-                $script:ChildLabel = 'Запасные провайдеры'
-                $fbInput = @{fallbacks=[object[]]$fallbackEntries} | ConvertTo-Json -Compress -Depth 6
-                # Up to 2 live checks of 3 x 45 s transport attempts each, plus the writes.
-                $fb = Run-Child $python @((Join-Path $PSScriptRoot 'fallbacks.py'),$homeDir) $fbInput 600
-                $fbLast = @($fb.Text -split "`n" | Where-Object { $_.Trim() })[-1]
-                $fbResults = @(($fbLast | ConvertFrom-Json).results)
-                for ($i = 0; $i -lt $fbTotal -and $i -lt $fbResults.Count; $i++) {
-                    $s = [string]$fbResults[$i].status
-                    if ($s -cin @('added','exists') -or $script:FallbackText.ContainsKey($s)) { $fbStatuses[$i] = $s }
-                }
-            } catch { }
-            $fbInput = $null; $fallbackEntries = @()
-            $fbDone = 0
-            for ($i = 0; $i -lt $fbTotal; $i++) {
-                if ($fbStatuses[$i] -cin @('added','exists')) { $fbDone++ }
-                else { Send-Event @{type='progress';message=('Запасной провайдер ' + ($i + 1) + ' не подключён: ' + $script:FallbackText[$fbStatuses[$i]] + '.')} }
-            }
-            $fallbackNote = "Запасные провайдеры: подключено $fbDone из $fbTotal."
-            Send-Event @{type='progress';message=$fallbackNote}
+            # Only after the primary is verified and the set ran.
+            $fallbackNote = (Invoke-Fallbacks $python $homeDir $fallbackEntries).note
+            $fallbackEntries = @()
         }
-        # Optional Telegram bot. Same contract as the set: never terminal, one fixed
-        # Russian line on failure, child output parsed (last line) and never relayed.
-        # Voice input (local faster-whisper) needs the VC++ runtime: Telegram voice notes
-        # AND the Desktop microphone, so this runs with or without a bot token. Before
-        # the Telegram step, so a voice note works right after pairing. Present = silent
-        # (the common case; UAC only on clean Windows); otherwise one start line + one
-        # outcome line, never terminal.
-        try {
-            if (-not (Test-VcRuntime)) {
-                Send-Event @{type='progress';message=$script:VcRuntimeText['start']}
-                $vc = Install-VcRuntime
-                if ($vc -eq 'present') { $vc = 'installed' }
-                if (-not $script:VcRuntimeText.ContainsKey($vc) -or $vc -eq 'start') { $vc = 'failed' }
-                Send-Event @{type='progress';message=$script:VcRuntimeText[$vc]}
-            }
-        } catch { Send-Event @{type='progress';message=$script:VcRuntimeText['failed']} }
-        $telegramNote = ''; $telegramBot = $null; $tgAutostart = $false
+        # Before the Telegram step, so a voice note works right after pairing.
+        Invoke-VcStep
+        $telegramNote = ''; $telegramBot = $null
         if ($telegramToken) {
-            Send-Event @{type='progress';message='Подключаю вашего Телеграм-бота…'}
-            $tgStatus = 'failed'; $tgBot = ''
-            try {
-                $script:ChildLabel = 'Подключение Телеграма'
-                $tg = Run-Child $python @((Join-Path $PSScriptRoot 'telegram.py'),$homeDir,$repo) (@{telegram_bot_token=$telegramToken} | ConvertTo-Json -Compress) 600
-                $tgLast = @($tg.Text -split "`n" | Where-Object { $_.Trim() })[-1]
-                $tgReply = $tgLast | ConvertFrom-Json
-                if ([string]$tgReply.status -cin @('connected','token','network','exists','open','saved','failed')) { $tgStatus = [string]$tgReply.status }
-                if ($tgStatus -eq 'connected' -and ($tg.Code -ne 0 -or $tgReply.ok -ne $true)) { $tgStatus = 'failed' }
-                if ($tgReply.bot -is [string] -and $tgReply.bot -cmatch '^[A-Za-z0-9_]{5,64}$') { $tgBot = ' @' + $tgReply.bot }
-                if ($tgStatus -eq 'connected' -and [string]$tgReply.autostart -cin @('task','startup')) { $tgAutostart = $true }
-            } catch { $tgStatus = 'failed' }
+            $tg = Invoke-TelegramConnect $python $homeDir $repo $telegramToken
             $telegramToken = $null
-            $tgText = @{
-                'connected' = "Телеграм подключён. Напишите вашему боту$tgBot любое сообщение и нажмите «Проверить» на этом экране."
-                'token'     = 'Телеграм не подключён: токен бота не принят. Hermes работает; проверьте токен у @BotFather и подключите бота позже в Hermes → «Сообщения».'
-                'network'   = 'Телеграм не подключён: нет связи с серверами Телеграм. Hermes работает; включите VPN и подключите бота позже в Hermes → «Сообщения».'
-                'exists'    = 'Телеграм не подключён: в Hermes уже настроен другой бот. Существующие настройки сохранены.'
-                'open'      = 'Телеграм не подключён: в настройках Hermes бот открыт для всех. Настройки не изменены.'
-                'saved'     = 'Телеграм-бот сохранён, но пока не запустился. Hermes работает; перезагрузите компьютер или откройте Hermes → «Сообщения» и перезапустите шлюз.'
-                'failed'    = 'Телеграм не подключён из-за ошибки. Hermes работает; подключите бота позже в Hermes → «Сообщения».'
-            }
-            if ($tgStatus -ne 'connected') { Send-Event @{type='progress';message=$tgText[$tgStatus]} }
-            $telegramNote = ' ' + $tgText[$tgStatus]
-            if ($tgStatus -eq 'connected') {
-                # The UI shows the owner-approval step only for a connected bot.
-                $telegramBot = if ($tgBot) { $tgBot.Trim().TrimStart('@') } else { '-' }
-                if (-not $tgAutostart) {
-                    # gateway_windows.install may exit 0 without any login entry: say so, stay non-fatal.
-                    $autostartLine = 'Бот работает сейчас, но автозапуск после перезагрузки не настроен: после перезагрузки откройте Hermes → «Сообщения» и запустите шлюз.'
-                    Send-Event @{type='progress';message=$autostartLine}
-                    $telegramNote += ' ' + $autostartLine
-                }
-            }
+            $telegramNote = $tg.note; $telegramBot = $tg.bot
         }
         if ($fallbackNote) { $fallbackNote = ' ' + $fallbackNote }
         $successEvent = @{type='success';message=('Hermes ответил через ваш API; настройки сохранены, файлы Desktop проверены.' + $fallbackNote + $telegramNote);launch_path=$desktopExe;launch_args=@()}
@@ -555,6 +642,129 @@ function Main {
         if ($locked) { $mutex.ReleaseMutex() }
         if ($mutex) { $mutex.Dispose() }
     }
+}
+# --- Maintenance: a second run of the installer is never a dead end ---------------
+# Defined after Main (still before it runs): configure.py is reached here only for a
+# completed install, after Main stripped the Telegram token and the backup keys.
+
+# Which Hermes this run serves. Never reads or returns a secret.
+#   none            no Hermes at the standard place: a fresh install
+#   ours_incomplete our journal, install or key check not finished: the resume/park path
+#   ours_completed  our journal, phase completed (any package revision)
+#   foreign         a Hermes this installer did not install: no usable journal of ours
+#                   next to an existing home, or HERMES_HOME pointing elsewhere
+# python is set only for ours_completed/foreign with the official layout's venv.
+function Resolve-Target([string]$Pin, [string]$Sid) {
+    $default = Join-Path $env:LOCALAPPDATA 'hermes'
+    $custom = [bool]($env:HERMES_HOME -and [IO.Path]::GetFullPath($env:HERMES_HOME).TrimEnd('\') -ine [IO.Path]::GetFullPath($default).TrimEnd('\'))
+    $homeDir = Assert-SafePath $(if ($custom) { $env:HERMES_HOME } else { $default })
+    $repo = Assert-SafePath (Join-Path $homeDir 'hermes-agent')
+    $journal = Journal-Path $homeDir; $null = Assert-SafePath $journal
+    $python = Join-Path $repo 'venv\Scripts\python.exe'
+    $target = [pscustomobject]@{state='none'; home=$homeDir; repo=$repo; python=$null; journal=$null; custom=$custom}
+    $exists = Test-Path -LiteralPath $homeDir -PathType Container
+    if (-not $custom -and $exists -and (Test-Path -LiteralPath $journal)) {
+        try { $target.journal = Read-Journal $homeDir $repo $Pin $Sid -AnyRevision } catch { $target.journal = $null }
+    }
+    if ($target.journal) { $target.state = if ($target.journal.phase -ceq 'completed') { 'ours_completed' } else { 'ours_incomplete' } }
+    elseif ($custom -or $exists) { $target.state = 'foreign' }
+    if ($target.state -cin @('ours_completed','foreign') -and (Test-Path -LiteralPath $python -PathType Leaf)) { $target.python = Assert-SafePath $python }
+    return $target
+}
+function Test-PublicUrl($Value) {
+    if ($Value -isnot [string] -or $Value.Length -gt 2048 -or $Value -match '[\s\x00-\x1F\x7F]') { return $false }
+    try { $uri = [Uri]$Value } catch { return $false }
+    return ($uri.IsAbsoluteUri -and $uri.Scheme -ceq 'https' -and $uri.Host -and -not $uri.UserInfo -and -not $uri.Query -and -not $uri.Fragment)
+}
+# One status record for the UI: which screen to open and what to show on it.
+function Send-Status($Target) {
+    $info = @{set_version=''; package_set_version=''; model_ours=$false; base_url=''; model=''; telegram=$false; backups=0; change_interrupted=$false}
+    if ($Target.python) {
+        try {
+            $script:ChildLabel = 'Проверка установки'
+            $child = Run-Child $Target.python @((Join-Path $PSScriptRoot 'extras.py'),$Target.home,$Target.repo,(Join-Path $PSScriptRoot 'assets'),'--status') '' 60
+            $reply = @($child.Text -split "`n" | Where-Object { $_.Trim() })[-1] | ConvertFrom-Json
+            if ($child.Code -eq 0 -and $reply.ok -eq $true) {
+                foreach ($name in @('set_version','package_set_version')) {
+                    if ($reply.$name -is [string] -and $reply.$name -cmatch '^[0-9]{1,4}(\.[0-9]{1,4}){0,3}$') { $info[$name] = $reply.$name }
+                }
+                if ($reply.telegram -is [bool]) { $info.telegram = $reply.telegram }
+                if ($reply.backups -is [int] -and $reply.backups -ge 0 -and $reply.backups -le 99) { $info.backups = $reply.backups }
+                # Provider details only for a Hermes of ours: that is what «Сменить провайдера» changes.
+                if ($Target.state -ceq 'ours_completed') {
+                    if ($reply.model_ours -is [bool]) { $info.model_ours = $reply.model_ours }
+                    if ($reply.change_interrupted -is [bool]) { $info.change_interrupted = $reply.change_interrupted }
+                    if (Test-PublicUrl $reply.base_url) { $info.base_url = $reply.base_url }
+                    if ($reply.model -is [string] -and $reply.model.Length -le 256 -and $reply.model -notmatch '[\x00-\x1F\x7F]') { $info.model = $reply.model }
+                }
+            }
+        } catch { }
+    }
+    $launch = ''
+    if ($Target.state -cin @('ours_completed','foreign')) { try { $launch = Check-Desktop $Target.repo } catch { $launch = '' } }
+    $text = @{
+        'none'            = 'Hermes на этом компьютере не найден: будет новая установка.'
+        'ours_incomplete' = 'Найдена незавершённая установка: установщик продолжит её.'
+        'ours_completed'  = 'Hermes уже установлен этим установщиком.'
+        'foreign'         = if ($Target.custom) { 'Hermes использует свою папку настроек (HERMES_HOME).' } elseif ($Target.python) { 'Найден Hermes, установленный не этим установщиком.' } else { 'Найдена папка Hermes без рабочей установки.' }
+    }
+    $event = @{type='status'; message=$text[$Target.state]; state=$Target.state; launch_path=$launch; set_supported=[bool]$Target.python}
+    foreach ($key in $info.Keys) { $event[$key] = $info[$key] }
+    Send-Event $event
+    return 0
+}
+function Invoke-Maintenance([string]$Action, $InputData, $Target, [object[]]$Fallbacks, [string]$TelegramToken) {
+    if ($Action -ceq 'status') { return (Send-Status $Target) }
+    $ours = $Target.state -ceq 'ours_completed'
+    if ($Action -cin @('update_set','change_provider') -and -not $ours) { Fail 'CONFIG' 'Это действие доступно только для Hermes, установленного этим установщиком. Ничего не изменено.' }
+    if ($Action -ceq 'foreign_add_set' -and $Target.state -cne 'foreign') { Fail 'CONFIG' 'Добавить набор можно только к Hermes, установленному не этим установщиком. Ничего не изменено.' }
+    if (-not $Target.python) { Fail 'CONFIG' 'Не найден установленный Hermes с рабочим Python. Ничего не изменено.' }
+    $homeDir = $Target.home; $repo = $Target.repo; $python = $Target.python
+    if ($Action -cin @('update_set','foreign_add_set')) {
+        # extras.py never touches the model block, .env or the journal: SOUL only if it is
+        # Hermes' default or an untouched earlier set, skills only if absent or untouched,
+        # MCP servers only added, retunes only of Hermes' exact defaults.
+        $set = Invoke-SetSteps $python $homeDir $repo
+        $complete = $set.set -and $set.marketplaces -cne 'failed'
+        $text = if ($Action -ceq 'update_set') {
+            if ($complete) { 'Набор обновлён. Навыки и файлы, которые вы меняли, не тронуты.' } else { 'Набор обновлён не полностью; Hermes работает. Закройте Hermes и нажмите «Обновить набор» ещё раз.' }
+        } else {
+            if ($complete) { 'Набор добавлен. Модель, ключи и ваши собственные навыки не изменены.' } else { 'Набор добавлен не полностью; Hermes работает. Закройте Hermes и повторите.' }
+        }
+        Send-Event @{type='done'; status=$(if ($complete) { 'ok' } else { 'partial' }); message=$text}
+        return 0
+    }
+    if ($Action -ceq 'change_provider') {
+        Send-Event @{type='progress';message='Проверяю новый ключ и реальный ответ Hermes. Проверка расходует небольшую квоту провайдера.'}
+        $request = @{endpoint=[string]$InputData.endpoint; api_key=[string]$InputData.api_key; model=[string]$InputData.model} | ConvertTo-Json -Compress
+        try {
+            $script:ChildLabel = 'Смена провайдера'
+            # configure.py --change: same live AIAgent check; replaces only our model block and
+            # HERMES_SUBSCRIBER_API_KEY, atomically with rollback; refuses a block not ours.
+            $helper = Run-Child $python @((Join-Path $PSScriptRoot 'configure.py'),$homeDir,$repo,'--change') $request 900
+        } finally { $request = $null }
+        try { $reply = @($helper.Text -split "`n" | Where-Object { $_.Trim() })[-1] | ConvertFrom-Json } catch { Fail 'VERIFY' 'Проверка Hermes не вернула корректный результат. Настройки не изменены.' }
+        if ($helper.Code -ne 0 -or $reply.ok -ne $true) {
+            $code = if ($reply.code -cin @('AUTH','NETWORK','QUOTA','CONFIG','VERIFY','INPUT')) { [string]$reply.code } else { 'VERIFY' }
+            Fail $code ([string]$reply.message)
+        }
+        Send-Event @{type='done'; status='ok'; message='Провайдер изменён: Hermes ответил через новый ключ. Если Hermes или Телеграм-бот уже запущены, перезапустите их.'}
+        return 0
+    }
+    if ($Action -ceq 'add_backups') {
+        $fb = Invoke-Fallbacks $python $homeDir $Fallbacks -Replace
+        $Fallbacks = $null
+        $complete = $fb.done -eq $fb.total
+        Send-Event @{type='done'; status=$(if ($complete) { 'ok' } else { 'partial' }); message=((@($fb.note) + @($fb.problems)) -join ' ')}
+        return 0
+    }
+    # telegram_connect
+    $tg = Invoke-TelegramConnect $python $homeDir $repo $TelegramToken
+    $TelegramToken = $null
+    $event = @{type='done'; status=$(if ($tg.status -ceq 'connected') { 'ok' } else { 'partial' }); message=$tg.note.Trim()}
+    if ($tg.bot) { $event['telegram_bot'] = $tg.bot }
+    Send-Event $event
+    return 0
 }
 # Dot-source permits offline unit tests of pure validation helpers, not fake installs.
 if ($MyInvocation.InvocationName -ne '.') { exit (Main) }

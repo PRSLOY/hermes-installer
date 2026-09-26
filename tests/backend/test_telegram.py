@@ -573,6 +573,33 @@ class AutostartTests(unittest.TestCase):
         self.task_code = 1
         self.assertIsNone(t.autostart_state(self.home))
 
+    # Windows Script Host reads UTF-8 without BOM as ANSI: a Cyrillic path breaks.
+    VBS = 'Set sh = CreateObject("WScript.Shell")\r\nsh.CurrentDirectory = "C:\\Users\\Павел Тест\\AppData\\Local\\hermes"\r\n'
+
+    def test_utf8_launcher_with_cyrillic_is_not_autostart(self):
+        (self.home / 'gateway-service' / 'Hermes_Gateway.vbs').write_bytes(self.VBS.encode('utf-8'))
+        (self.startup / 'Hermes_Gateway.vbs').write_bytes(self.VBS.encode('utf-8'))
+        self.assertIsNone(t.autostart_state(self.home))
+
+    def test_fix_rewrites_both_launchers_as_utf16_bom_same_text(self):
+        launcher = self.home / 'gateway-service' / 'Hermes_Gateway.vbs'
+        startup = self.startup / 'Hermes_Gateway.vbs'
+        launcher.write_bytes(self.VBS.encode('utf-8'))
+        startup.write_bytes(self.VBS.encode('utf-8'))
+        t.fix_vbs_encoding(self.home)
+        for path in (launcher, startup):
+            data = path.read_bytes()
+            self.assertTrue(data.startswith(b'\xff\xfe'))
+            self.assertEqual(data[2:].decode('utf-16-le'), self.VBS)
+        self.assertEqual(t.autostart_state(self.home), 'startup')
+        self.assertEqual([p.name for p in startup.parent.iterdir()], ['Hermes_Gateway.vbs'])
+
+    def test_ascii_launcher_is_left_untouched(self):
+        launcher = self.home / 'gateway-service' / 'Hermes_Gateway.vbs'
+        launcher.write_bytes(b'WScript.Quit 0\r\n')
+        t.fix_vbs_encoding(self.home)
+        self.assertEqual(launcher.read_bytes(), b'WScript.Quit 0\r\n')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

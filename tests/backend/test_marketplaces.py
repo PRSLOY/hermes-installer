@@ -652,6 +652,25 @@ class InstallTests(unittest.TestCase):
             e.safe_extract(archive, Path(self.tmp.name) / 'out')
         self.assertFalse((Path(self.tmp.name) / 'evil.txt').exists())
 
+class ProxyDestinationTests(unittest.TestCase):
+    """Security review 2026-09-24: the proxy must not reach this machine or the LAN."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dp = load('direct_proxy_dest', ASSETS / 'direct_proxy.py')
+
+    def test_local_and_private_addresses_are_refused(self):
+        for ip in ('127.0.0.1', '10.0.0.5', '192.168.1.103', '172.19.0.1', '169.254.1.1', '0.0.0.0', '224.0.0.1'):
+            self.assertFalse(self.dp.public_address(ip), ip)
+
+    def test_public_and_vpn_fake_ip_addresses_pass(self):
+        for ip in ('93.184.216.34', '87.250.250.242', '198.18.0.7'):
+            self.assertTrue(self.dp.public_address(ip), ip)
+
+    def test_empty_host_loopback_and_odd_ports_never_connect(self):
+        for host, port in (('', 80), ('127.0.0.1', 443), ('localhost', 80), ('example.com', 22), ('example.com', 34567)):
+            with self.assertRaises(ValueError):
+                self.dp.direct_connect(host, port, None, timeout=1)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

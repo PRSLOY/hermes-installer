@@ -1,5 +1,9 @@
 """Real runtime/config stage. JSON in, one JSON result out. Never run in tests.
 Only credential storage (.env) receives the key; probe sandbox has a protected ACL.
+
+`configure.py HOME REPO --change` («Сменить провайдера или ключ» on a completed
+install): the same live check, then our model block and HERMES_SUBSCRIBER_API_KEY
+are replaced. Refused when the model block is not the one this installer wrote.
 """
 import contextlib
 import io
@@ -7,12 +11,28 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from provider import Failure, base_url_candidates, select_model, configured_text, check_hermes_result, guard_runtime_http
+
+KEY_NAME = 'HERMES_SUBSCRIBER_API_KEY'
+KEY_REF = '${HERMES_SUBSCRIBER_API_KEY}'
+# Exactly the keys provider.configured_text writes.
+MODEL_KEYS = frozenset(('default', 'provider', 'base_url', 'api_key', 'api_mode', 'max_tokens'))
+# Present only while a provider change writes .env and config.yaml (see main).
+CHANGE_PENDING = '.subscriber-change-pending'
+
+
+def model_block_is_ours(block):
+    """The model block this installer wrote: our key reference, a custom provider and
+    no key we did not write. Hermes or the user switching the provider breaks it."""
+    return (isinstance(block, dict) and block.get('api_key') == KEY_REF
+            and block.get('provider') == 'custom' and set(block) <= MODEL_KEYS)
 
 
 def protect(path):
@@ -37,13 +57,31 @@ def atomic_write(path, data, secret=False):
         tmp.unlink(missing_ok=True)
 
 
-def authorize_checkpoint(home, repo):
+def authorize_checkpoint(home, repo, maintain=False):
+    # maintain: a completed install of ours (any package revision) instead of phase 'configuring'.
     ps = Path(os.environ['SYSTEMROOT']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
     result = subprocess.run([str(ps), '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-                             '-File', str(Path(__file__).with_name('checkpoint.ps1')), str(home), str(repo)],
+                             '-File', str(Path(__file__).with_name('checkpoint.ps1')), str(home), str(repo)]
+                            + (['maintain'] if maintain else []),
                             capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
     if result.returncode or result.stdout.strip() != b'authorized':
         raise Failure('CONFIG', 'Нет действующего checkpoint установщика; настройки не изменены.')
+
+
+def with_env_value(text, name, quoted):
+    """.env text with `name` set to the already-quoted value: its single existing line
+    replaced in place (line ending kept), or one line appended. Every other byte stays."""
+    lines = text.splitlines(keepends=True)
+    pattern = re.compile(r'^[ \t]*(export[ \t]+)?' + re.escape(name) + r'[ \t]*=')
+    hits = [i for i, line in enumerate(lines) if pattern.match(line)]
+    if len(hits) > 1:
+        raise Failure('CONFIG', 'Ключ установщика записан в хранилище несколько раз. Настройки не изменены.')
+    if not hits:
+        return text + ('\n' if text and not text.endswith('\n') else '') + name + '=' + quoted + '\n'
+    line = lines[hits[0]]
+    ending = line[len(line.rstrip('\r\n')):]
+    lines[hits[0]] = name + '=' + quoted + ending
+    return ''.join(lines)
 
 
 def rollback(config_path, before, env_path, env_before, changed_config, changed_env):
@@ -56,11 +94,11 @@ def rollback(config_path, before, env_path, env_before, changed_config, changed_
         else: atomic_write(env_path, env_before, secret=True)
 
 
-def main(home, repo, data):
+def main(home, repo, data, change=False):
     import yaml
     from dotenv import dotenv_values
     # Validate unresolved paths first: resolve() would hide junctions.
-    authorize_checkpoint(home, repo)
+    authorize_checkpoint(home, repo, change)
     home = Path(home).resolve()
     repo = Path(repo).resolve()
     base = base_url_candidates(data['endpoint'])[0]
@@ -75,54 +113,40 @@ def main(home, repo, data):
     pristine = bool(template.exists() and before == template.read_bytes() == shipped_template.read_bytes())
     # Early conflict check precedes billable network traffic.
     old = (yaml.safe_load(src) or {}).get('model') or {}
-    if old and not pristine and not (isinstance(old, dict) and old.get('api_key') == '${HERMES_SUBSCRIBER_API_KEY}' and old.get('base_url') == base):
+    if change:
+        if not model_block_is_ours(old):
+            raise Failure('CONFIG', 'Настройки модели изменены вне установщика (например, в Hermes). Чтобы их не потерять, смените провайдера в самом Hermes → «Настройки».')
+    elif old and not pristine and not (isinstance(old, dict) and old.get('api_key') == KEY_REF and old.get('base_url') == base):
         raise Failure('CONFIG', 'Найдены существующие настройки модели. Чтобы сохранить их, автоматическая настройка остановлена.')
     model = select_model(base, key, data.get('model') or '')
-    candidate = configured_text(src, base, model, allow_template=pristine)
+    # A change replaces our own block; allow_template only lifts the "any existing block" refusal.
+    candidate = configured_text(src, base, model, allow_template=pristine or change)
     env_text = (env_before or b'').decode('utf-8-sig')
-    existing_key = dotenv_values(stream=io.StringIO(env_text)).get('HERMES_SUBSCRIBER_API_KEY')
-    if existing_key is not None and existing_key != key:
-        raise Failure('CONFIG', 'В хранилище уже другой ключ установщика. Автоматическая перезапись отключена для сохранности данных.')
+    env_old = dotenv_values(stream=io.StringIO(env_text))
+    existing_key = env_old.get(KEY_NAME)
     # python-dotenv single-quote escaping, not shell interpolation.
     quoted = "'" + key.replace('\\', '\\\\').replace("'", "\\'") + "'"
-    env_candidate = env_text if existing_key is not None else env_text + ('\n' if env_text and not env_text.endswith('\n') else '') + 'HERMES_SUBSCRIBER_API_KEY=' + quoted + '\n'
+    if change:
+        env_candidate = with_env_value(env_text, KEY_NAME, quoted)
+        env_new = dotenv_values(stream=io.StringIO(env_candidate))
+        if env_new.get(KEY_NAME) != key or {k: v for k, v in env_new.items() if k != KEY_NAME} != {k: v for k, v in env_old.items() if k != KEY_NAME}:
+            raise Failure('CONFIG', 'Хранилище ключей в неожиданном формате. Настройки не изменены.')
+    else:
+        if existing_key is not None and existing_key != key:
+            raise Failure('CONFIG', 'В хранилище уже другой ключ установщика. Автоматическая перезапись отключена для сохранности данных.')
+        env_candidate = env_text if existing_key is not None else env_text + ('\n' if env_text and not env_text.endswith('\n') else '') + KEY_NAME + '=' + quoted + '\n'
 
-    # Isolate verification from user's plugins, tools, memory, cron, sessions and rules.
-    # This calls the installed, real AIAgent, not a synthetic HTTP-only success.
-    with tempfile.TemporaryDirectory(prefix='.subscriber-check-', dir=home) as sandbox:
-        protect(Path(sandbox))
-        safe_cfg = {'model': yaml.safe_load(candidate)['model'], 'mcp_servers': {},
-                    'memory': {'memory_enabled': False, 'user_profile_enabled': False},
-                    'compression': {'enabled': False}, 'fallback_providers': []}
-        Path(sandbox, 'config.yaml').write_text(yaml.safe_dump(safe_cfg), encoding='utf-8')
-        os.environ['HERMES_HOME'] = sandbox
-        os.environ['HERMES_SUBSCRIBER_API_KEY'] = key
-        os.environ['HERMES_INTERACTIVE'] = '0'
-        with guard_runtime_http(base, key):
-            # Do not import the running host: explicitly prioritize the installed repo.
-            sys.path.insert(0, str(repo))
-            logging.disable(logging.CRITICAL)
-            captured = io.StringIO()
-            with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
-                from hermes_cli.config import load_config
-                from run_agent import AIAgent
-                cfg = load_config()['model']
-                if cfg.get('base_url') != base or cfg.get('api_key') != key or cfg.get('default') != model:
-                    raise Failure('CONFIG', 'Hermes не распознал настройки API. Настройки не сохранены.')
-                agent = AIAgent(api_key=cfg['api_key'], base_url=cfg['base_url'], model=cfg['default'],
-                    provider='custom', api_mode='chat_completions', enabled_toolsets=[],
-                    max_iterations=1, max_tokens=3000, quiet_mode=True, save_trajectories=False,
-                    skip_context_files=True, skip_memory=True, skip_background_review=True,
-                    load_soul_identity=False, fallback_model=None, run_budget_seconds=90)
-                try:
-                    check_hermes_result(agent.run_conversation('Reply with one word: capital of Japan'))
-                finally:
-                    agent.close()
-            captured.close()
-    authorize_checkpoint(home, repo)
+    verify_with_hermes(home, repo, yaml.safe_load(candidate)['model'], base, key, model)
+    authorize_checkpoint(home, repo, change)
     # Concurrent external edits must not be lost; installer mutex only serializes us.
     if (config_path.read_bytes() if config_path.exists() else None) != before or (env_path.read_bytes() if env_path.exists() else None) != env_before:
         raise Failure('CONFIG', 'Настройки изменились во время проверки. Ничего не записано; повторите.')
+    # A change writes two files; a kill between them would pair the new key with the old
+    # address. The marker (no secret in it) outlives such a kill: the maintenance screen then
+    # asks to save the change again. Cleared after success or a completed rollback.
+    pending = home / CHANGE_PENDING
+    if change:
+        atomic_write(pending, b'provider change in progress\n')
     changed_env = changed_config = False
     try:
         atomic_write(env_path, env_candidate.encode('utf-8'), secret=True)
@@ -130,16 +154,69 @@ def main(home, repo, data):
         atomic_write(config_path, candidate.encode('utf-8'))
         changed_config = True
         parsed = yaml.safe_load(config_path.read_text(encoding='utf-8'))
-        if parsed['model'] != yaml.safe_load(candidate)['model'] or dotenv_values(env_path).get('HERMES_SUBSCRIBER_API_KEY') != key:
+        if parsed['model'] != yaml.safe_load(candidate)['model'] or dotenv_values(env_path).get(KEY_NAME) != key:
             raise Failure('CONFIG', 'Контрольное чтение настроек не прошло; выполняется откат.')
     except Failure as exc:
         # Keep the specific reason (e.g. ACL/protect failure) instead of a generic one.
         rollback(config_path, before, env_path, env_before, changed_config, changed_env)
+        pending.unlink(missing_ok=True)
         raise
     except Exception:
         rollback(config_path, before, env_path, env_before, changed_config, changed_env)
+        pending.unlink(missing_ok=True)
         raise Failure('CONFIG', 'Не удалось сохранить настройки. Выполняется откат; проверьте доступ к папке Hermes.') from None
+    pending.unlink(missing_ok=True)
     return {'ok': True}
+
+
+def verify_with_hermes(home, repo, model_cfg, base, key, model):
+    """Live check through the installed, real AIAgent, isolated from the user's
+    plugins, tools, memory, cron, sessions and rules. Raises Failure."""
+    import yaml
+    with tempfile.TemporaryDirectory(prefix='.subscriber-check-', dir=home) as sandbox:
+        protect(Path(sandbox))
+        safe_cfg = {'model': model_cfg, 'mcp_servers': {},
+                    'memory': {'memory_enabled': False, 'user_profile_enabled': False},
+                    'compression': {'enabled': False}, 'fallback_providers': []}
+        Path(sandbox, 'config.yaml').write_text(yaml.safe_dump(safe_cfg), encoding='utf-8')
+        saved = {name: os.environ.get(name) for name in ('HERMES_HOME', KEY_NAME, 'HERMES_INTERACTIVE')}
+        os.environ['HERMES_HOME'] = sandbox
+        os.environ[KEY_NAME] = key
+        os.environ['HERMES_INTERACTIVE'] = '0'
+        try:
+            run_agent_check(repo, base, key, model)
+        finally:
+            # Children started later (checkpoint.ps1, protect.ps1) must not inherit the key.
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+
+def run_agent_check(repo, base, key, model):
+    """The AIAgent run itself; the caller owns the environment it needs."""
+    with guard_runtime_http(base, key):
+        # Do not import the running host: explicitly prioritize the installed repo.
+        sys.path.insert(0, str(repo))
+        logging.disable(logging.CRITICAL)
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+            from hermes_cli.config import load_config
+            from run_agent import AIAgent
+            cfg = load_config()['model']
+            if cfg.get('base_url') != base or cfg.get('api_key') != key or cfg.get('default') != model:
+                raise Failure('CONFIG', 'Hermes не распознал настройки API. Настройки не сохранены.')
+            agent = AIAgent(api_key=cfg['api_key'], base_url=cfg['base_url'], model=cfg['default'],
+                provider='custom', api_mode='chat_completions', enabled_toolsets=[],
+                max_iterations=1, max_tokens=3000, quiet_mode=True, save_trajectories=False,
+                skip_context_files=True, skip_memory=True, skip_background_review=True,
+                load_soul_identity=False, fallback_model=None, run_budget_seconds=90)
+            try:
+                check_hermes_result(agent.run_conversation('Reply with one word: capital of Japan'))
+            finally:
+                agent.close()
+        captured.close()
 
 
 if __name__ == '__main__':
@@ -148,7 +225,7 @@ if __name__ == '__main__':
         sys.stdin.reconfigure(encoding='utf-8-sig')
         sys.stdout.reconfigure(encoding='utf-8')
         data = json.load(sys.stdin)
-        output = main(Path(sys.argv[1]), Path(sys.argv[2]), data)
+        output = main(Path(sys.argv[1]), Path(sys.argv[2]), data, change=sys.argv[3:4] == ['--change'])
         code = 0
     except Failure as exc:
         output = {'ok': False, 'code': exc.code, 'message': str(exc)}

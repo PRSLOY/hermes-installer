@@ -1948,21 +1948,25 @@ function Test-Node {
     Write-Info "(no admin rights required; isolated from any system Node install)"
     try {
         $arch = Get-WindowsArch
-        $indexUrl = "https://nodejs.org/dist/latest-v${NodeVersion}.x/"
-        $indexPage = $null
-        if (-not (Invoke-DownloadWithRetry -Uri $indexUrl -OutFile "$env:TEMP\node-index.html" -Label 'node index')) {
-            throw "Node.js index download failed after retries: $indexUrl"
-        }
-        $indexPage = [pscustomobject]@{ Content = (Get-Content "$env:TEMP\node-index.html" -Raw) }
-        $zipName = ($indexPage.Content | Select-String -Pattern "node-v${NodeVersion}\.\d+\.\d+-win-${arch}\.zip" -AllMatches).Matches[0].Value
+        # Subscriber patch (issue #22): a pinned Node.js build verified by SHA-256 from the
+        # official https://nodejs.org/dist/v22.23.3/SHASUMS256.txt (cross-checked against an
+        # independent read in PR #19), instead of "whatever latest-v22.x is today" over TLS
+        # only. The same file is also taken from mirrors when nodejs.org is slow or blocked:
+        # any source whose bytes differ is discarded (Invoke-DownloadFromSources -Sha256).
+        $nodePin = '22.23.3'
+        $nodeSha = @{ 'x64' = '2b0ff57b049cda1bbcea2240eec20467018713c1efe1f7360c2681859b90ed71'; 'arm64' = '33dad22e4cef5ee8f9fbb1b0d037fdacd0e56d12a4580f0d63f68b894deab535' }
+        $zipName = if ($nodeSha.ContainsKey($arch)) { "node-v$nodePin-win-$arch.zip" } else { $null }
 
         if ($zipName) {
-            $downloadUrl = "${indexUrl}${zipName}"
             $tmpZip = "$env:TEMP\$zipName"
             $tmpDir = "$env:TEMP\hermes-node-extract"
-
-            if (-not (Invoke-DownloadWithRetry -Uri $downloadUrl -OutFile $tmpZip -Label $zipName)) {
-                throw "Node.js download failed after retries: $zipName"
+            $nodeSources = @(
+                "https://nodejs.org/dist/v$nodePin/$zipName",
+                "https://registry.npmmirror.com/-/binary/node/v$nodePin/$zipName",
+                "https://mirrors.huaweicloud.com/nodejs/v$nodePin/$zipName"
+            )
+            if (-not (Invoke-DownloadFromSources -Sources $nodeSources -OutFile $tmpZip -Label $zipName -MinBytes 10000000 -Sha256 $nodeSha[$arch])) {
+                throw "Node.js download failed or did not match the pinned SHA-256: $zipName"
             }
             if (Test-Path $tmpDir) { Remove-Item -Recurse -Force $tmpDir }
             Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
@@ -2638,13 +2642,33 @@ function Install-Repository {
                 # is 159 chars; under %TEMP% the extracted path reached ~275 > MAX_PATH (260) on
                 # Windows without LongPathsEnabled (the default), so both Expand-Archive and
                 # ZipFile failed and the proxied ZIP route could never succeed (Windows Sandbox,
-                # github.com blocked, 2026-09-24). A drive-root folder keeps it ~228; %TEMP% stays
-                # as the fallback when the drive root is not writable.
+                # github.com blocked, 2026-09-24). A drive-root folder keeps it ~228; when the drive root
+                # is not writable, %LOCALAPPDATA%\hx-* (~40 chars shorter than %TEMP%, which never fit).
                 $extractPath = $null
-                foreach ($candidate in @(("$env:SystemDrive\hx-" + [Guid]::NewGuid().ToString('N').Substring(0, 8)), "$env:TEMP\hermes-agent-extract")) {
+                foreach ($candidate in @(("$env:SystemDrive\hx-" + [Guid]::NewGuid().ToString('N').Substring(0, 8)), ("$env:LOCALAPPDATA\hx-" + [Guid]::NewGuid().ToString('N').Substring(0, 8)))) {
                     try { [void][IO.Directory]::CreateDirectory($candidate); [IO.Directory]::Delete($candidate); $extractPath = $candidate; break } catch { }
                 }
                 if (-not $extractPath) { throw "Repository archive download failed: no writable extraction folder" }
+                # Subscriber patch: a drive-root folder inherits "Authenticated Users: Modify" from
+                # C:\, and a same-volume move keeps those ACEs -- any local account could edit the
+                # verified code between the manifest check and the move, and later in
+                # %LOCALAPPDATA%\hermes\hermes-agent (security review 2026-09-24). The folder is
+                # created atomically with a protected DACL (this user, SYSTEM, Administrators);
+                # a folder that already exists or has another owner is refused.
+                function New-PrivateExtractDir([string]$Path) {
+                    if (Test-Path -LiteralPath $Path) { throw "extraction folder already exists: $Path" }
+                    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
+                    $admins = New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544'
+                    $sec = New-Object Security.AccessControl.DirectorySecurity
+                    $sec.SetAccessRuleProtection($true, $false)
+                    foreach ($sid in @($me, (New-Object Security.Principal.SecurityIdentifier 'S-1-5-18'), $admins)) {
+                        $sec.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+                    }
+                    [void][IO.Directory]::CreateDirectory($Path, $sec)
+                    $acl = [IO.Directory]::GetAccessControl($Path)
+                    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier])
+                    if (-not $acl.AreAccessRulesProtected -or ($owner -ne $me -and $owner -ne $admins)) { throw "extraction folder is not private: $Path" }
+                }
 
                 # Direct GitHub first, then archive proxies for blocked-github networks.
                 $zipSources = @($zipUrl)
@@ -2675,6 +2699,7 @@ function Install-Repository {
                                 if (-not $target.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw "archive entry escapes the extraction folder: $($entry.FullName)" }
                             }
                         } finally { $zipRead.Dispose() }
+                        New-PrivateExtractDir $extractPath
                         [IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $extractPath)
                     } catch {
                         Write-Warn "  hermes-agent ${zipLabel}: $zipSource did not extract ($($_.Exception.Message)); trying the next source"

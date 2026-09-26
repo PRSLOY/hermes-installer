@@ -25,6 +25,9 @@ namespace HermesSetup
     public sealed class InstallerForm : Form
     {
         public const int PageChoose = 0, PageKey = 1, PageInstall = 2, PageDone = 3;
+        // «Hermes уже установлен»: a second run of the installer is never a dead end. Shown instead
+        // of the provider screen when the worker's "status" finds a Hermes (ours or not).
+        public const int PageMaintain = 4;
         const int Inset = 24;
         static readonly string[] StageChain = { "Проверяем компьютер", "Скачиваем файлы", "Устанавливаем", "Подключаем ключ" };
 
@@ -95,7 +98,33 @@ namespace HermesSetup
         readonly Label statusHint = new Label { Name = "StatusHint", Text = "Проверка отправит короткий запрос модели и может расходовать небольшую квоту подписки.", AutoSize = true, Tag = "wrap", ForeColor = UiTheme.Muted, Margin = new Padding(0, 8, 0, 0) };
         readonly Label copyHint = new Label { Name = "CopyHint", Text = "Клик по строке копирует её.", AutoSize = true, Tag = "wrap", ForeColor = UiTheme.Muted, Margin = new Padding(0, 4, 0, 0) };
 
-        readonly Panel[] pages = new Panel[4];
+        // --- maintenance screen ---
+        readonly Label maintHead = new Label { Name = "MaintainHead", AutoSize = true, Font = UiTheme.Font(18F, FontStyle.Bold), ForeColor = UiTheme.Text, Margin = new Padding(0, 2, 0, 6) };
+        readonly Label maintSummary = new Label { Name = "MaintainSummary", AutoSize = true, Tag = "wrap", ForeColor = UiTheme.Text, Font = UiTheme.Font(10.5f), Margin = new Padding(0, 0, 0, 4) };
+        readonly Label maintNote = new Label { Name = "MaintainNote", AutoSize = true, Tag = "wrap", ForeColor = UiTheme.Muted, Margin = new Padding(0, 0, 0, 8) };
+        readonly FlowLayoutPanel maintActions = new FlowLayoutPanel { Name = "MaintainActions", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = true, Dock = DockStyle.Top, BackColor = UiTheme.Background, Margin = new Padding(0, 2, 0, 2), Tag = "wrap" };
+        readonly RoundedButton maintUpdate = MaintButton("MaintainUpdate", "Обновить набор");
+        readonly RoundedButton maintTelegram = MaintButton("MaintainTelegram", "Подключить Телеграм");
+        readonly RoundedButton maintBackups = MaintButton("MaintainBackups", "Запасные ключи");
+        readonly RoundedButton maintChange = MaintButton("MaintainChange", "Сменить провайдера или ключ");
+        // Bot token entry: replaces the action list while open, so the screen keeps its 560x500 budget.
+        readonly TableLayoutPanel maintTgPanel = new TableLayoutPanel { Name = "MaintainTelegramPanel", Visible = false, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Top, ColumnCount = 1, RowCount = 3, BackColor = UiTheme.Background, Margin = Padding.Empty };
+        public readonly TextBox MaintTelegramToken = Field("MaintTelegramToken", 128, true, 30);
+        readonly RoundedButton maintTgConnect = new RoundedButton { Name = "MaintainTelegramConnect", Text = "Подключить", Primary = true, Width = 150, Height = 36, Font = UiTheme.Font(10.5F, FontStyle.Bold), Margin = new Padding(0, 0, 8, 0) };
+        readonly RoundedButton maintTgCancel = new RoundedButton { Name = "MaintainTelegramCancel", Text = "Отмена", Primary = false, Width = 110, Height = 36, Font = UiTheme.Font(10F), Margin = Padding.Empty };
+        readonly ProgressBar maintBar = new ProgressBar { Name = "MaintainBar", Dock = DockStyle.Top, Height = 8, Style = ProgressBarStyle.Marquee, Visible = false, Margin = new Padding(0, 8, 0, 4) };
+        public readonly Label MaintStatus = new Label { Name = "MaintainStatus", AutoSize = true, Tag = "wrap", ForeColor = UiTheme.Text, Font = UiTheme.Font(10.5f), Margin = new Padding(0, 6, 0, 0) };
+        readonly Label doneHead = new Label { Name = "DoneHead", Text = "Готово — Hermes установлен", AutoSize = true, Font = UiTheme.Font(18F, FontStyle.Bold), ForeColor = UiTheme.Text, Margin = new Padding(0, 2, 0, 6) };
+        readonly Label doneBody = new Label { Name = "DoneBody", Text = "Провайдер подключён, ответ модели проверен. Нажмите «Открыть Hermes».", AutoSize = true, Tag = "wrap", ForeColor = UiTheme.Muted, Margin = new Padding(0, 0, 0, 10) };
+        InstallStatus installed;
+        // «Сменить провайдера или ключ» reuses the provider and key screens; «Сохранить» runs change_provider.
+        bool changeMode;
+        static RoundedButton MaintButton(string name, string text)
+        {
+            return new RoundedButton { Name = name, Text = text, Primary = false, Width = 230, Height = 38, Font = UiTheme.Font(10F), Margin = new Padding(0, 0, 8, 8) };
+        }
+
+        readonly Panel[] pages = new Panel[5];
         readonly ProviderCard[] cards = new ProviderCard[0];
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 1000 };
         int selected = 0;
@@ -243,7 +272,8 @@ namespace HermesSetup
             pages[PageKey] = BuildKeyPage();
             pages[PageInstall] = BuildInstallPage();
             pages[PageDone] = BuildDonePage();
-            string[] pageNames = { "PageChoose", "PageKey", "PageInstall", "PageDone" };
+            pages[PageMaintain] = BuildMaintainPage();
+            string[] pageNames = { "PageChoose", "PageKey", "PageInstall", "PageDone", "PageMaintain" };
             for (int i = 0; i < pages.Length; i++) { pages[i].Name = pageNames[i]; pages[i].Dock = DockStyle.Fill; pages[i].Visible = false; content.Controls.Add(pages[i]); }
             content.Resize += delegate { UpdateWraps(); };
 
@@ -265,14 +295,15 @@ namespace HermesSetup
             footer.Controls.Add(Next, 2, 0);
             footer.Controls.Add(Launch, 3, 0);
             footer.Controls.Add(CancelInstall, 4, 0);
-            Back.Click += delegate { if (PageIndex == PageKey) GoTo(PageChoose); };
-            Next.Click += delegate { OnNext(); };
-            CancelInstall.Click += delegate { if (running && !Stopping && AskStop()) StopInstall(); };
-            Launch.Click += delegate
+            Back.Click += delegate
             {
-                try { LaunchPolicy.Start(result); Status.ForeColor = UiTheme.Success; Status.Text = "Hermes запущен. Дождитесь появления окна Desktop."; }
-                catch { Status.Text = "Не удалось открыть Hermes. Повторите проверку установки; если ошибка повторяется, обратитесь в поддержку."; Launch.Enabled = false; }
+                if (PageIndex == PageKey) GoTo(PageChoose);
+                else if (PageIndex == PageChoose && changeMode) LeaveChangeMode();
+                else if (PageIndex == PageDone && installed != null) GoTo(PageMaintain);
             };
+            Next.Click += delegate { OnNext(); };
+            CancelInstall.Click += delegate { if (running && !Stopping && (PageIndex == PageMaintain || AskStop())) StopInstall(); };
+            Launch.Click += delegate { TryLaunch(); };
 
             shell.Controls.Add(header, 0, 0);
             shell.Controls.Add(content, 0, 1);
@@ -297,7 +328,7 @@ namespace HermesSetup
                 e.Cancel = true;
                 if (Stopping || AskStop()) { closeAfterStop = true; StopInstall(); }
             };
-            FormClosed += delegate { timer.Dispose(); ApiKey.Clear(); TelegramToken.Clear(); ClearBackups(); };
+            FormClosed += delegate { timer.Dispose(); ApiKey.Clear(); TelegramToken.Clear(); MaintTelegramToken.Clear(); ClearBackups(); };
 
             SelectProvider(0);
             GoTo(PageChoose);
@@ -402,7 +433,7 @@ namespace HermesSetup
             var show = new RoundedButton { Text = "Показать", Primary = false, Width = 104, Height = 32, Font = UiTheme.Font(9.5f), Margin = new Padding(8, 0, 0, 0) };
             paste.Click += delegate
             {
-                try { if (Clipboard.ContainsText()) { ApiKey.Text = Clipboard.GetText().Trim(); ApiKey.SelectionStart = ApiKey.TextLength; KeyError.Text = ""; } }
+                try { if (Clipboard.ContainsText()) { string pasted = Clipboard.GetText(); ApiKey.Text = pasted.Trim(); ApiKey.SelectionStart = ApiKey.TextLength; KeyError.Text = ""; SecretClipboard.Forget(pasted); } }
                 catch { KeyError.Text = "Не удалось прочитать буфер обмена. Вставьте ключ вручную (Ctrl+V)."; }
             };
             show.Click += delegate
@@ -518,8 +549,8 @@ namespace HermesSetup
         {
             var page = new Panel { BackColor = UiTheme.Background };
             var root = Stack(10);
-            root.Controls.Add(Head("Готово — Hermes установлен"), 0, 0);
-            root.Controls.Add(Body("Провайдер подключён, ответ модели проверен. Нажмите «Открыть Hermes»."), 0, 1);
+            root.Controls.Add(doneHead, 0, 0);
+            root.Controls.Add(doneBody, 0, 1);
             var examplesHead = new Label { Text = "Пишите обычными словами. Примеры первых запросов:", AutoSize = true, Font = UiTheme.Font(11F, FontStyle.Bold), ForeColor = UiTheme.Text, Margin = new Padding(0, 8, 0, 6) };
             doneExamples.Add(examplesHead);
             doneExamples.Add(Example("Привет! Что ты умеешь и с чего начнём?"));
@@ -550,6 +581,333 @@ namespace HermesSetup
             root.Controls.Add(tgStep, 0, 9);
             page.Controls.Add(root);
             return page;
+        }
+
+        Panel BuildMaintainPage()
+        {
+            var page = new Panel { BackColor = UiTheme.Background };
+            var root = Stack(7);
+            root.Controls.Add(maintHead, 0, 0);
+            root.Controls.Add(maintSummary, 0, 1);
+            root.Controls.Add(maintNote, 0, 2);
+            maintActions.Controls.Add(maintUpdate);
+            maintActions.Controls.Add(maintTelegram);
+            maintActions.Controls.Add(maintBackups);
+            maintActions.Controls.Add(maintChange);
+            root.Controls.Add(maintActions, 0, 3);
+
+            maintTgPanel.ColumnStyles.Clear(); maintTgPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            maintTgPanel.Controls.Add(new Label { Text = "Создайте бота у @BotFather → /newbot → скопируйте токен и вставьте сюда", AutoSize = true, Tag = "wrap", ForeColor = UiTheme.Muted, Margin = new Padding(0, 2, 0, 4) }, 0, 0);
+            var tgRow = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, RowCount = 1, BackColor = UiTheme.Background, Margin = Padding.Empty };
+            tgRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            tgRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            var botFather = new RoundedButton { Name = "MaintainBotFather", Text = "Открыть @BotFather", Primary = false, Width = 168, Height = 32, Font = UiTheme.Font(9.5f), Margin = new Padding(8, 0, 0, 0) };
+            botFather.Click += delegate
+            {
+                try { Process.Start(new ProcessStartInfo("https://t.me/BotFather") { UseShellExecute = true }); }
+                catch { MessageBox.Show(this, "Не удалось открыть ссылку. Откройте в Телеграм бота @BotFather вручную.", "Hermes", MessageBoxButtons.OK, MessageBoxIcon.Information); }
+            };
+            tgRow.Controls.Add(MaintTelegramToken, 0, 0);
+            tgRow.Controls.Add(botFather, 1, 0);
+            maintTgPanel.Controls.Add(tgRow, 0, 1);
+            var tgButtons = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = true, BackColor = UiTheme.Background, Margin = new Padding(0, 8, 0, 0) };
+            tgButtons.Controls.Add(maintTgConnect); tgButtons.Controls.Add(maintTgCancel);
+            maintTgPanel.Controls.Add(tgButtons, 0, 2);
+            root.Controls.Add(maintTgPanel, 0, 4);
+            root.Controls.Add(maintBar, 0, 5);
+            root.Controls.Add(MaintStatus, 0, 6);
+
+            maintUpdate.Click += delegate
+            {
+                if (installed == null) return;
+                RunMaintenance(new MaintenanceRequest { Action = installed.State == InstallStatus.Foreign ? MaintenanceRequest.ForeignAddSet : MaintenanceRequest.UpdateSet });
+            };
+            maintTelegram.Click += delegate
+            {
+                if (installed == null || running) return;
+                if (installed.Telegram) OpenTelegramApproval(null); else ShowTelegramEntry(true);
+            };
+            maintBackups.Click += delegate { OpenMaintenanceBackups(); };
+            maintChange.Click += delegate { BeginChangeProvider(); };
+            maintTgConnect.Click += delegate { ConnectTelegram(); };
+            maintTgCancel.Click += delegate { MaintTelegramToken.Clear(); ShowTelegramEntry(false); };
+            page.Controls.Add(root);
+            return page;
+        }
+
+        // Said on the screen the person is looking at (Done or maintenance), and the button
+        // stays enabled: after a quarantine is lifted the same click works.
+        public void TryLaunch()
+        {
+            try { LaunchPolicy.Start(result); ShowLaunchNote("Hermes запускается. Дождитесь появления окна Desktop.", UiTheme.Success); }
+            catch { ShowLaunchNote(LaunchFailedText(result == null ? null : result.LaunchPath), UiTheme.Error); }
+        }
+        public static string LaunchFailedText(string path)
+        {
+            return "Не удалось открыть Hermes. Часто это антивирус: он мог поместить Hermes.exe в карантин. Верните файл из карантина и добавьте исключение для "
+                + (String.IsNullOrEmpty(path) ? "папки Hermes" : path) + ", затем нажмите «Открыть Hermes» ещё раз.";
+        }
+        public string LaunchNote { get { return PageIndex == PageMaintain ? MaintStatus.Text : TelegramNote.Text; } }
+        void ShowLaunchNote(string text, Color color)
+        {
+            if (PageIndex == PageMaintain) { ShowMaintenanceMessage(text, color); return; }
+            TelegramNote.ForeColor = color;
+            TelegramNote.Text = text;
+            TelegramNote.Visible = true;
+            UpdateWraps();
+        }
+
+        // --- maintenance: detection, the screen, its actions ----------------------------
+        bool detecting;
+        readonly System.Collections.Generic.List<string> offered = new System.Collections.Generic.List<string>();
+        int changeStartPage = PageChoose;
+        public InstallStatus Installed { get { return installed; } }
+        public bool IsChangeMode { get { return changeMode; } }
+        public bool TelegramEntryShown { get { return maintTgPanel.Tag != null; } }
+        public string MaintenanceSummary { get { return maintSummary.Text; } }
+        public string MaintenanceNote { get { return maintNote.Text; } }
+        public string MaintenanceHeading { get { return maintHead.Text; } }
+        // What the screen offers (tests read it; Control.Visible is false while the form is hidden).
+        public string[] MaintenanceActions { get { return offered.ToArray(); } }
+        public string PrimaryMaintenanceAction { get { foreach (RoundedButton b in new[] { maintUpdate, maintTelegram, maintBackups, maintChange }) if (b.Primary && offered.Contains(b.Text)) return b.Text; return null; } }
+
+        // Called once the window is shown (Program.Main): a fresh computer keeps today's wizard;
+        // an existing Hermes opens the maintenance screen. Any failure falls back to the wizard.
+        public async void DetectExisting()
+        {
+            detecting = true;
+            stepLabel.Text = "Проверяю, установлен ли Hermes…";
+            RefreshButtons();
+            Outcome outcome = null;
+            try { outcome = await WorkerClient.RunStatusAsync(WorkerPath); } catch { outcome = null; }
+            detecting = false;
+            if (IsDisposed) return;
+            if (outcome != null && outcome.Success && outcome.Status != null && outcome.Status.Existing && !running)
+            {
+                ApplyStatus(outcome.Status);
+                GoTo(PageMaintain);
+            }
+            else GoTo(PageIndex);
+        }
+        // After an action: the summary (set version, Telegram, backups) is read again.
+        async void RefreshStatus()
+        {
+            Outcome outcome = null;
+            try { outcome = await WorkerClient.RunStatusAsync(WorkerPath); } catch { outcome = null; }
+            if (IsDisposed || running) return;
+            if (outcome != null && outcome.Success && outcome.Status != null && outcome.Status.Existing) ApplyStatus(outcome.Status);
+        }
+
+        public void ApplyStatus(InstallStatus status)
+        {
+            if (status == null || !status.Existing) return;
+            installed = status;
+            // «Открыть Hermes» only for the packed Desktop LaunchPolicy accepts (checked again on click).
+            result = String.IsNullOrEmpty(status.LaunchPath) ? null : new Outcome { Success = true, LaunchPath = status.LaunchPath, LaunchArgs = new string[0] };
+            bool ours = status.State == InstallStatus.OursCompleted;
+            bool served = status.SetSupported;
+            bool update = status.UpdateAvailable;
+            maintHead.Text = ours ? "Hermes уже установлен" : "У вас уже есть Hermes";
+            if (ours)
+            {
+                string host = status.ProviderHost;
+                string provider = !status.ModelOurs ? "Модель настроена в самом Hermes."
+                    : "Провайдер: " + (host.Length > 0 ? host : "свой") + (String.IsNullOrEmpty(status.Model) ? "" : " · модель " + status.Model);
+                string set = "Набор: " + (String.IsNullOrEmpty(status.SetVersion) ? "версия не записана" : "версия " + status.SetVersion)
+                    + (update ? " — доступно обновление до " + status.PackageSetVersion : "");
+                maintSummary.Text = provider + "\r\nТелеграм: " + (status.Telegram ? "подключён" : "не подключён") + " · запасных ключей: " + status.Backups + "\r\n" + set;
+                maintNote.Text = !served ? "Не найден Python этой установки: действия недоступны. Переустановите Hermes."
+                    : update ? "Обновление добавит новые навыки и настройки. Навыки и файлы, которые вы меняли, не тронутся."
+                    : status.ModelOurs ? "Набор актуален. Можно подключить Телеграм, добавить запасные ключи или сменить провайдера."
+                    : "Набор актуален. Сменить провайдера здесь нельзя: модель изменена вне установщика.";
+                if (served && status.ModelOurs && status.ChangeInterrupted)
+                    maintNote.Text = "Прошлая смена провайдера была прервана: ключ и адрес провайдера могут не совпадать. Нажмите «Сменить провайдера или ключ» и сохраните ещё раз.";
+            }
+            else
+            {
+                maintSummary.Text = "Добавить наш набор (личность, навыки, поиск, маркетплейсы) к нему? Настройки модели и ключи не изменятся.";
+                maintNote.Text = !served ? (status.Message ?? "") + " Добавить набор нельзя: не найден Python этой установки (папка hermes-agent)."
+                    : "Личность заменится, только если у вас стандартная; ваши навыки, серверы MCP и настройки не трогаются."
+                      + (String.IsNullOrEmpty(status.SetVersion) ? "" : " Набор уже добавлен: версия " + status.SetVersion + ".");
+            }
+            maintUpdate.Text = ours || !String.IsNullOrEmpty(status.SetVersion) ? "Обновить набор" : "Добавить набор";
+            bool resumeChange = served && ours && status.ModelOurs && status.ChangeInterrupted;
+            maintChange.Primary = resumeChange;
+            maintUpdate.Primary = !resumeChange && served && (ours ? update : (String.IsNullOrEmpty(status.SetVersion) || update));
+            maintTelegram.Text = status.Telegram ? "Подтвердить Телеграм" : "Подключить Телеграм";
+            offered.Clear();
+            SetOffered(maintUpdate, served);
+            SetOffered(maintTelegram, served);
+            SetOffered(maintBackups, served);
+            SetOffered(maintChange, served && ours && status.ModelOurs);
+            foreach (Control c in maintActions.Controls) c.Invalidate();
+            if (changeStartPage == PageChoose) SelectInstalledProvider();
+            UpdateWraps();
+            RefreshButtons();
+        }
+        void SetOffered(RoundedButton button, bool on)
+        {
+            button.Visible = on;
+            if (on) offered.Add(button.Text);
+        }
+        // The provider screen starts on the installed provider: changing only the key is one click.
+        void SelectInstalledProvider()
+        {
+            if (installed == null || String.IsNullOrEmpty(installed.BaseUrl)) return;
+            string current = Request.NormalizeEndpoint(installed.BaseUrl);
+            for (int i = 0; i < cards.Length; i++)
+                if (!cards[i].Preset.IsCustom && String.Equals(cards[i].Preset.endpoint, current, StringComparison.OrdinalIgnoreCase)) { SelectProvider(i); return; }
+        }
+
+        // Bot token entry replaces the action list while it is open.
+        public void ShowTelegramEntry(bool show)
+        {
+            maintTgPanel.Tag = show ? (object)true : null;
+            maintTgPanel.Visible = show;
+            maintActions.Visible = !show;
+            if (show) { MaintStatus.Text = ""; MaintTelegramToken.Focus(); }
+            UpdateWraps();
+        }
+        void ConnectTelegram()
+        {
+            RunMaintenance(new MaintenanceRequest { Action = MaintenanceRequest.TelegramConnect, TelegramToken = MaintTelegramToken.Text });
+        }
+
+        // Presets a backup may use on an installed Hermes: never "Другой", never its current primary.
+        public System.Collections.Generic.List<ProviderPreset> MaintenanceBackupCandidates()
+        {
+            var list = new System.Collections.Generic.List<ProviderPreset>();
+            string primary = installed == null ? "" : Request.NormalizeEndpoint(installed.BaseUrl);
+            foreach (var card in cards)
+            {
+                ProviderPreset p = card.Preset;
+                if (p.IsCustom || String.IsNullOrEmpty(p.endpoint) || String.Equals(p.endpoint, primary, StringComparison.OrdinalIgnoreCase)) continue;
+                list.Add(p);
+            }
+            return list;
+        }
+        public BackupKeysDialog CreateMaintenanceBackupDialog()
+        {
+            return new BackupKeysDialog(MaintenanceBackupCandidates(), null, installed == null ? "" : installed.BaseUrl);
+        }
+        public MaintenanceRequest BuildBackupRequest(BackupKeysDialog dialog)
+        {
+            if (dialog == null || dialog.Result == null || dialog.Result.Count == 0) return null;
+            var entries = new System.Collections.Generic.List<FallbackEntry>();
+            foreach (var b in dialog.Result)
+                entries.Add(new FallbackEntry { provider_id = b.Preset.id, endpoint = b.Preset.endpoint, model = b.Preset.model ?? "", api_key = b.Key });
+            return new MaintenanceRequest { Action = MaintenanceRequest.AddBackups, Fallbacks = entries, PrimaryEndpoint = installed == null ? "" : installed.BaseUrl };
+        }
+        void OpenMaintenanceBackups()
+        {
+            if (running || installed == null) return;
+            if (MaintenanceBackupCandidates().Count == 0) { ShowMaintenanceMessage("В списке нет провайдеров, которые можно добавить запасными.", UiTheme.Text); return; }
+            MaintenanceRequest request = null;
+            using (var dialog = CreateMaintenanceBackupDialog())
+                if (dialog.ShowDialog(this) == DialogResult.OK) request = BuildBackupRequest(dialog);
+            if (request != null) RunMaintenance(request);
+        }
+
+        // «Сменить провайдера или ключ»: the provider and key screens, «Сохранить» instead of «Установить».
+        public void BeginChangeProvider()
+        {
+            if (running || installed == null) return;
+            changeMode = true;
+            ApiKey.Clear(); KeyError.Text = "";
+            ShowTelegramEntry(false);
+            GoTo(changeStartPage);
+            if (changeStartPage == PageKey) ApiKey.Focus();
+        }
+        public void LeaveChangeMode()
+        {
+            changeMode = false;
+            ApiKey.Clear(); KeyError.Text = "";
+            GoTo(PageMaintain);
+        }
+        void SaveProviderChange()
+        {
+            var request = BuildRequest();
+            request.telegram_bot_token = null; request.fallbacks = null;
+            changeMode = false;
+            RunMaintenance(new MaintenanceRequest { Action = MaintenanceRequest.ChangeProvider, Provider = request });
+        }
+
+        public void OpenTelegramApproval(string bot) { OpenTelegramApproval(bot, false); }
+        public void OpenTelegramApproval(string bot, bool autostartMissing)
+        {
+            doneHead.Text = "Телеграм";
+            doneBody.Text = "Бот подключён к Hermes. Подтвердите, что он ваш: отвечать он будет только вам.";
+            TelegramNote.Visible = false;
+            tgCheck.Visible = true;
+            ShowTelegramStep(bot ?? "-", autostartMissing);
+            GoTo(PageDone);
+        }
+
+        void ShowMaintenanceMessage(string text, Color color)
+        {
+            MaintStatus.ForeColor = color;
+            MaintStatus.Text = text ?? "";
+            UpdateWraps();
+        }
+        static string MaintenanceStartText(string action)
+        {
+            switch (action)
+            {
+                case MaintenanceRequest.UpdateSet: return "Обновляю набор. Это может занять несколько минут.";
+                case MaintenanceRequest.ForeignAddSet: return "Добавляю набор. Это может занять несколько минут.";
+                case MaintenanceRequest.ChangeProvider: return "Проверяю новый ключ и ответ Hermes…";
+                case MaintenanceRequest.AddBackups: return "Проверяю запасные ключи…";
+                default: return "Подключаю Телеграм-бота…";
+            }
+        }
+        public void ShowMaintenanceResult(Outcome outcome)
+        {
+            if (outcome.Cancelled) { ShowMaintenanceMessage("Действие остановлено. Hermes работает; повторите, когда будет удобно.", UiTheme.Text); return; }
+            Color color = !outcome.Success ? UiTheme.Error : outcome.MaintenanceStatus == "ok" ? UiTheme.Success : UiTheme.Text;
+            ShowMaintenanceMessage(outcome.Message, color);
+        }
+
+        async void RunMaintenance(MaintenanceRequest request)
+        {
+            if (running || request == null) return;
+            string problem = request.Validate();
+            if (problem != null)
+            {
+                if (request.Action == MaintenanceRequest.ChangeProvider) { changeMode = true; KeyError.Text = problem; GoTo(PageKey); }
+                else ShowMaintenanceMessage(problem, UiTheme.Error);
+                return;
+            }
+            running = true; stop = new CancellationTokenSource(); closeAfterStop = false;
+            GoTo(PageMaintain);
+            maintBar.Visible = true;
+            ShowMaintenanceMessage(MaintenanceStartText(request.Action), UiTheme.Text);
+            LogAppend("Действие: " + request.Action);
+            RefreshButtons();
+            Outcome outcome;
+            try
+            {
+                outcome = await WorkerClient.RunMaintenanceAsync(WorkerPath, request,
+                    delegate(string message) { if (!IsDisposed) BeginInvoke((Action)delegate { LogAppend(message); if (running) MaintStatus.Text = message; }); },
+                    stop.Token);
+            }
+            catch { outcome = Outcome.Failure("INTERNAL", "Не удалось выполнить действие. Hermes работает; повторите."); }
+            finally { request.ClearSecrets(); }
+            running = false;
+            if (stop != null) { stop.Dispose(); stop = null; }
+            if (IsDisposed) return;
+            maintBar.Visible = false;
+            if (request.Action == MaintenanceRequest.ChangeProvider)
+            {
+                ApiKey.Clear();
+                // A rejected key goes straight back to the key screen next time; anything else to the providers.
+                changeStartPage = !outcome.Success && outcome.Code == "AUTH" ? PageKey : PageChoose;
+            }
+            if (request.Action == MaintenanceRequest.TelegramConnect) { MaintTelegramToken.Clear(); if (outcome.Success) ShowTelegramEntry(false); }
+            ShowMaintenanceResult(outcome);
+            RefreshButtons();
+            if (closeAfterStop) { BeginInvoke((Action)Close); return; }
+            if (outcome.Success && outcome.TelegramBot != null) OpenTelegramApproval(outcome.TelegramBot, outcome.Message != null && outcome.Message.Contains(AutostartMissingMarker));
+            if (outcome.Success) RefreshStatus();
         }
 
         // A click on an example copies it: the user's very first Hermes request is
@@ -628,12 +986,16 @@ namespace HermesSetup
 
         public void GoTo(int page)
         {
-            if (page < 0 || page > PageDone) return;
+            if (page < 0 || page > PageMaintain) return;
             PageIndex = page;
             // A custom primary address may have changed on screen 1.
             if (page == PageKey) RefreshBackupLink();
+            // A provider change touches only the primary: Telegram and backups have their own actions.
+            telegramLink.Visible = !changeMode;
+            if (changeMode && telegramVisible) ToggleTelegramField();
+            if (changeMode) backupLink.Visible = false;
             for (int i = 0; i < pages.Length; i++) pages[i].Visible = (i == page);
-            stepLabel.Text = "Экран " + (page + 1) + " из 4";
+            stepLabel.Text = installed != null ? "Hermes установлен" : "Экран " + (page + 1) + " из 4";
             UpdateWraps();
             RefreshButtons();
         }
@@ -662,15 +1024,17 @@ namespace HermesSetup
 
         void RefreshButtons()
         {
-            Back.Visible = (PageIndex == PageKey) && !running;
+            Back.Visible = !running && (PageIndex == PageKey || (PageIndex == PageChoose && changeMode) || (PageIndex == PageDone && installed != null));
             Next.Visible = (PageIndex == PageChoose || PageIndex == PageKey);
             // "Открыть Hermes" is always present on the last screen but only
-            // becomes active after a verified success.
-            Launch.Visible = (PageIndex == PageDone);
+            // becomes active after a verified success (maintenance: a verified Desktop path).
+            Launch.Visible = (PageIndex == PageDone || PageIndex == PageMaintain);
             Launch.Enabled = !running && result != null && result.Success;
-            Next.Text = PageIndex == PageChoose ? "Далее" : "Установить";
-            Next.Enabled = !running && catalogValid && (PageIndex == PageChoose ? CanChoose : true);
-            CancelInstall.Visible = running && PageIndex == PageInstall;
+            Next.Text = PageIndex == PageChoose ? "Далее" : changeMode ? "Сохранить" : "Установить";
+            Next.Enabled = !running && catalogValid && !detecting && (PageIndex == PageChoose ? CanChoose : true);
+            CancelInstall.Visible = running && (PageIndex == PageInstall || PageIndex == PageMaintain);
+            foreach (Control c in maintActions.Controls) c.Enabled = !running;
+            maintTgConnect.Enabled = maintTgCancel.Enabled = !running;
             CancelInstall.Enabled = !Stopping;
         }
 
@@ -682,6 +1046,7 @@ namespace HermesSetup
             var request = BuildRequest();
             string validation = request.Validate();
             if (validation != null) { KeyError.Text = validation; return; }
+            if (changeMode) { SaveProviderChange(); return; }
             StartInstall();
         }
 
@@ -722,9 +1087,12 @@ namespace HermesSetup
                     ApiKey.Clear(); TelegramToken.Clear();
                     bool connected = telegramRequested && result.TelegramBot != null;
                     // Not connected: show why (backend's fixed text). Connected: the approval step.
-                    TelegramNote.Text = telegramRequested && !connected ? result.Message : "";
-                    TelegramNote.Visible = telegramRequested && !connected;
-                    if (connected) ShowTelegramStep(result.TelegramBot);
+                    // Stopped during the optional steps: what was skipped. Telegram not connected: why.
+                    bool note = result.Partial || (telegramRequested && !connected);
+                    TelegramNote.ForeColor = UiTheme.Text;
+                    TelegramNote.Text = note ? result.Message : "";
+                    TelegramNote.Visible = note;
+                    if (connected) ShowTelegramStep(result.TelegramBot, result.Message != null && result.Message.Contains(AutostartMissingMarker));
                     GoTo(PageDone);
                 }
                 else ShowFailure(result);
@@ -754,6 +1122,7 @@ namespace HermesSetup
         {
             if (!running || stop == null || Stopping) return;
             stop.Cancel();
+            if (PageIndex == PageMaintain) ShowMaintenanceMessage("Останавливаю…", UiTheme.Text);
             Status.ForeColor = UiTheme.Text;
             Status.Text = "Останавливаю установку…";
             LogAppend("Остановка по запросу пользователя.");
@@ -798,11 +1167,15 @@ namespace HermesSetup
 
         // --- Telegram owner approval (Done screen) -------------------------------
         // Never approves anyone without the owner's explicit «Да, это я» click.
-        public void ShowTelegramStep(string bot)
+        // worker.ps1's fixed line when the gateway runs now but has no login autostart.
+        public const string AutostartMissingMarker = "автозапуск после перезагрузки не настроен";
+        public void ShowTelegramStep(string bot) { ShowTelegramStep(bot, false); }
+        public void ShowTelegramStep(string bot, bool autostartMissing)
         {
             tgBotName = bot == "-" ? null : bot;
             string who = tgBotName == null ? "вашему боту" : "вашему боту @" + tgBotName;
-            tgStepText.Text = "1. Напишите " + who + " в Телеграм любое сообщение. Он может ответить служебным текстом на английском — это нормально.\r\n2. Нажмите «Проверить» и подтвердите, что это вы.";
+            tgStepText.Text = "1. Напишите " + who + " в Телеграм любое сообщение. Он может ответить служебным текстом на английском — это нормально.\r\n2. Нажмите «Проверить» и подтвердите, что это вы."
+                + (autostartMissing ? "\r\nВажно: автозапуск бота после перезагрузки не настроен. После перезагрузки откройте Hermes → «Сообщения» и запустите шлюз." : "");
             tgOpenBot.Visible = tgBotName != null;
             tgStatus.Text = ""; tgStatus.ForeColor = UiTheme.Muted;
             tgRequests.Controls.Clear(); tgRequests.RowStyles.Clear(); tgRequests.RowCount = 0;
@@ -1000,7 +1373,14 @@ namespace HermesSetup
             using (var mutex = new Mutex(true, @"Local\HermesSubscriberSetup.Ui.v1", out created))
             {
                 if (!created) { MessageBox.Show("Установщик уже открыт. Переключитесь в его окно.", "Hermes", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
-                try { Application.Run(new InstallerForm()); }
+                if (ElevationGuard.ShouldWarn()) { MessageBox.Show(ElevationGuard.Message, "Hermes", MessageBoxButtons.OK, MessageBoxIcon.Warning); mutex.ReleaseMutex(); return; }
+                try
+                {
+                    var form = new InstallerForm();
+                    // Only the real window asks the worker what is installed; tests build the form without it.
+                    form.Shown += delegate { form.DetectExisting(); };
+                    Application.Run(form);
+                }
                 finally { mutex.ReleaseMutex(); }
             }
         }

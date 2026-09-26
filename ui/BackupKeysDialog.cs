@@ -5,6 +5,18 @@ using System.Windows.Forms;
 
 namespace HermesSetup
 {
+    // A key pasted with «Вставить из буфера» does not stay in the clipboard for the next paste
+    // (a chat, a browser). Only when the clipboard still holds exactly what was pasted: a copy
+    // made meanwhile is the user's. Windows clipboard history (Win+V) is outside our reach.
+    public static class SecretClipboard
+    {
+        public static void Forget(string pasted)
+        {
+            try { if (!String.IsNullOrEmpty(pasted) && Clipboard.ContainsText() && Clipboard.GetText() == pasted) Clipboard.Clear(); }
+            catch { }
+        }
+    }
+
     // One chosen backup provider (issue #10). The key lives in memory only and is
     // dropped after install like the primary key.
     public sealed class BackupSelection
@@ -140,7 +152,7 @@ namespace HermesSetup
             int row = i;
             paste.Click += delegate
             {
-                try { if (Clipboard.ContainsText()) { Keys[row].Text = Clipboard.GetText().Trim(); Keys[row].SelectionStart = Keys[row].TextLength; error.Text = ""; } }
+                try { if (Clipboard.ContainsText()) { string pasted = Clipboard.GetText(); Keys[row].Text = pasted.Trim(); Keys[row].SelectionStart = Keys[row].TextLength; error.Text = ""; SecretClipboard.Forget(pasted); } }
                 catch { error.Text = "Не удалось прочитать буфер обмена. Вставьте ключ вручную (Ctrl+V)."; }
             };
             remove.Click += delegate { RemoveRow(row); };

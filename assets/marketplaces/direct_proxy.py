@@ -17,6 +17,7 @@ Log: <state dir>/proxy.log (see direct_common.state_dir), never the package.
 Windows-only, stdlib-only. Nothing here writes to stdout.
 """
 
+import ipaddress
 import os
 import socket
 import sys
@@ -33,8 +34,29 @@ def log(message):
     _log(LOG_NAME, message)
 
 
+# Web ports only, public addresses only (security review 2026-09-24): the proxy
+# resolves names itself, so a page in the scraping browser could otherwise reach
+# 127.0.0.1 or the home LAN through it (DNS rebinding bypasses the browser's own
+# checks), and an empty host resolves to this machine's own addresses.
+ALLOWED_PORTS = (80, 443)
+# TUN VPN clients hand out fake-IP answers from the benchmark range; not local.
+FAKE_IP = ipaddress.ip_network('198.18.0.0/15')
+
+
+def public_address(ip):
+    a = ipaddress.ip_address(ip)
+    if a in FAKE_IP:
+        return True
+    return not (a.is_loopback or a.is_private or a.is_link_local or a.is_multicast
+                or a.is_unspecified or a.is_reserved)
+
+
 def direct_connect(host, port, source_ip, timeout=30):
-    infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    if not host or port not in ALLOWED_PORTS:
+        raise ValueError('refused destination %r:%s' % (host, port))
+    infos = [i for i in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM) if public_address(i[4][0])]
+    if not infos:
+        raise ValueError('refused non-public destination %r' % host)
     last = None
     for family, stype, proto, _canon, addr in infos:
         s = socket.socket(family, stype, proto)

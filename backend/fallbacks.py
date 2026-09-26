@@ -23,6 +23,11 @@ Both files are written together, re-read and compared with the expected parse
 (every other config key and every other .env value unchanged), and both are
 rolled back on any mismatch. An entry whose base_url is already in the chain is
 'exists' and nothing is touched (idempotent re-run).
+
+With {"replace": true} («Запасные ключи» on an installed Hermes) an entry whose
+base_url is already in the chain AS ONE OF OURS (custom provider, key_env
+HERMES_SUBSCRIBER_FALLBACK_<n>_KEY, no other keys) gets the new key and model
+after the same live check: status 'replaced'. Someone else's entry stays 'exists'.
 """
 import copy
 import io
@@ -39,6 +44,8 @@ from provider import Failure, base_url_candidates, select_model
 
 MAX_FALLBACKS = 3
 ENV_NAME = 'HERMES_SUBSCRIBER_FALLBACK_{}_KEY'
+OUR_ENV = re.compile(r'^HERMES_SUBSCRIBER_FALLBACK_[1-9]_KEY$')
+ENTRY_KEYS = frozenset(('provider', 'model', 'base_url', 'api_mode', 'key_env'))
 KEY_RE = re.compile(r'^[\x21-\x7E]{8,8192}$')
 ID_RE = re.compile(r'^[A-Za-z0-9_.-]{1,64}$')
 STATUS_BY_CODE = {'AUTH': 'auth', 'QUOTA': 'quota', 'NETWORK': 'network', 'VERIFY': 'verify'}
@@ -170,11 +177,35 @@ def free_slot(env, chain, key, taken):
     return None
 
 
-def commit(home, before, env_before, src, cfg, chain, additions):
-    """Write .env then config.yaml; True only if both landed and verified."""
+def ours(entry):
+    """A chain entry this installer wrote (see the module docstring)."""
+    return (isinstance(entry, dict) and set(entry) <= ENTRY_KEYS and entry.get('provider') == 'custom'
+            and isinstance(entry.get('key_env'), str) and OUR_ENV.match(entry['key_env']) is not None)
+
+
+def with_env_value(text, name, quoted):
+    """.env text with `name` set: its single line replaced in place, or one line appended."""
+    lines = text.splitlines(keepends=True)
+    pattern = re.compile(r'^[ \t]*(export[ \t]+)?' + re.escape(name) + r'[ \t]*=')
+    hits = [i for i, line in enumerate(lines) if pattern.match(line)]
+    if len(hits) > 1:
+        raise Failure('FALLBACK', 'Запасной ключ записан в хранилище несколько раз. Настройки не изменены.')
+    if not hits:
+        return text + ('\n' if text and not text.endswith('\n') else '') + name + '=' + quoted + '\n'
+    line = lines[hits[0]]
+    lines[hits[0]] = name + '=' + quoted + line[len(line.rstrip('\r\n')):]
+    return ''.join(lines)
+
+
+def commit(home, before, env_before, src, cfg, chain, additions, replacements=()):
+    """Write .env then config.yaml; True only if both landed and verified.
+    replacements: (chain index, new entry, env name, key) for entries of ours."""
     import yaml
     config_path, env_path = home / 'config.yaml', home / '.env'
-    new_chain = copy.deepcopy(chain) + [entry for entry, _, _ in additions]
+    new_chain = copy.deepcopy(chain)
+    for index, entry, _, _ in replacements:
+        new_chain[index] = entry
+    new_chain += [entry for entry, _, _ in additions]
     expected = copy.deepcopy(cfg)
     expected['fallback_providers'] = new_chain
     candidate = with_chain(src, new_chain)
@@ -182,16 +213,21 @@ def commit(home, before, env_before, src, cfg, chain, additions):
         return False
     env_text = (env_before or b'').decode('utf-8-sig')
     env_old = env_values(env_before)
-    lines = ''.join(name + '=' + dotenv_quote(key) + '\n' for _, name, key in additions if env_old.get(name) != key)
-    env_candidate = env_text + ('\n' if lines and env_text and not env_text.endswith('\n') else '') + lines
+    updates = [(name, key) for _, name, key in additions] + [(name, key) for _, _, name, key in replacements]
+    env_candidate = env_text
+    for name, key in updates:
+        if env_old.get(name) != key:
+            env_candidate = with_env_value(env_candidate, name, dotenv_quote(key))
     expected_env = dict(env_old)
-    expected_env.update({name: key for _, name, key in additions})
+    expected_env.update(dict(updates))
+    if env_values(env_candidate.encode('utf-8')) != expected_env:
+        return False
     # Live checks can take minutes: never write over an edit made meanwhile.
     if read_bytes(config_path) != before or read_bytes(env_path) != env_before:
         return False
     changed_env = changed_config = False
     try:
-        if lines:
+        if env_candidate != env_text:
             atomic_write(env_path, env_candidate.encode('utf-8'), secret=True)
             changed_env = True
         atomic_write(config_path, candidate.encode('utf-8'))
@@ -206,7 +242,7 @@ def commit(home, before, env_before, src, cfg, chain, additions):
     return True
 
 
-def main(home, entries, probe=None):
+def main(home, entries, probe=None, replace=False):
     probe = probe or select_model
     home = Path(home)
     entries = entries if isinstance(entries, list) else []
@@ -233,6 +269,7 @@ def main(home, entries, probe=None):
     primary = normalized(model_cfg.get('base_url')) if isinstance(model_cfg, dict) else ''
     known = {normalized(e.get('base_url')) for e in chain if isinstance(e, dict)}
     requested, taken, additions, indexes = set(), set(), [], []
+    replacements, replaced = [], []
     for index, raw in enumerate(entries):
         parsed = parse_entry(raw)
         if parsed is None:
@@ -240,6 +277,27 @@ def main(home, entries, probe=None):
         base, model, key = parsed
         if normalized(base) in known:
             results[index]['status'] = 'exists'
+            slot = next((j for j, e in enumerate(chain) if isinstance(e, dict) and normalized(e.get('base_url')) == normalized(base)), None)
+            if not replace or normalized(base) in requested or not ours(chain[slot]):
+                continue
+            requested.add(normalized(base))
+            name = chain[slot]['key_env']
+            if env.get(name) == key and (not model or model == chain[slot].get('model')):
+                continue
+            try:
+                model = probe(base, key, model)
+            except Failure as exc:
+                results[index]['status'] = STATUS_BY_CODE.get(exc.code, 'failed')
+                continue
+            except Exception:
+                results[index]['status'] = 'failed'
+                continue
+            if not isinstance(model, str) or not model:
+                results[index]['status'] = 'failed'
+                continue
+            replacements.append((slot, {'provider': 'custom', 'model': model, 'base_url': base,
+                                        'api_mode': 'chat_completions', 'key_env': name}, name, key))
+            replaced.append(index)
             continue
         # The primary itself or a duplicate within this request is never a backup.
         if normalized(base) == primary or normalized(base) in requested:
@@ -261,14 +319,16 @@ def main(home, entries, probe=None):
         additions.append(({'provider': 'custom', 'model': model, 'base_url': base,
                            'api_mode': 'chat_completions', 'key_env': name}, name, key))
         indexes.append(index)
-    if additions:
+    if additions or replacements:
         try:
-            landed = commit(home, before, env_before, src, cfg, chain, additions)
+            landed = commit(home, before, env_before, src, cfg, chain, additions, replacements)
         except Exception:
             landed = False
         for index in indexes:
             results[index]['status'] = 'added' if landed else 'failed'
-    return {'ok': all(r['status'] in ('added', 'exists') for r in results), 'results': results}
+        for index in replaced:
+            results[index]['status'] = 'replaced' if landed else 'failed'
+    return {'ok': all(r['status'] in ('added', 'exists', 'replaced') for r in results), 'results': results}
 
 
 if __name__ == '__main__':
@@ -280,7 +340,7 @@ if __name__ == '__main__':
         sys.stdout.reconfigure(encoding='utf-8')
         data = json.load(sys.stdin)
         entries = data.get('fallbacks') if isinstance(data, dict) else []
-        output = main(Path(sys.argv[1]), entries)
+        output = main(Path(sys.argv[1]), entries, replace=isinstance(data, dict) and data.get('replace') is True)
     except Exception:
         # Never serialize exceptions: provider/SDK errors may contain credentials.
         listed = entries if isinstance(entries, list) else []

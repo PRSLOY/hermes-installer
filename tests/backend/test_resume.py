@@ -105,7 +105,8 @@ class ResumeTests(unittest.TestCase):
         # 'changed', 'added' and 'completed' used to refuse too. An interrupted tree is now parked
         # aside untouched and reinstalled (test_changed_interrupted_tree_is_parked_and_reinstalled);
         # foreign settings/keys, a forged or foreign journal and a wrong pin still refuse.
-        for mode in ['corrupt','foreign','config','env','pin','bad-snapshot']:
+        # 'pin' (an earlier package's journal) is parked and reinstalled now, like any interruption.
+        for mode in ['corrupt','foreign','config','env','bad-snapshot']:
             with self.subTest(mode=mode),tempfile.TemporaryDirectory(prefix='subscriber-resume-negative-') as tmp:
                 root=Path(tmp); self.interrupted(root)
                 marker=root/'hermes.subscriber-checkpoint.json'
@@ -129,11 +130,15 @@ class ResumeTests(unittest.TestCase):
 
     def test_changed_interrupted_tree_is_parked_and_reinstalled(self):
         """After Cancel the tree differs from the lagging checkpoint: park it, install clean."""
-        for mode in ['changed','added','completed']:
+        for mode in ['changed','added','completed','pin']:
             with self.subTest(mode=mode),tempfile.TemporaryDirectory(prefix='subscriber-resume-park-') as tmp:
                 root=Path(tmp); self.interrupted(root)
-                target={'changed':'hermes-agent/partial.txt','added':'user.txt','completed':'hermes-agent/.hermes-bootstrap-complete'}[mode]
+                target={'changed':'hermes-agent/partial.txt','added':'user.txt','completed':'hermes-agent/.hermes-bootstrap-complete','pin':'hermes-agent/partial.txt'}[mode]
                 (root/'hermes'/target).write_text('INTERRUPTED STATE')
+                if mode=='pin':
+                    cmd=f". '{ROOT/'backend/worker.ps1'}'; $h=Assert-SafePath '{root/'hermes'}'; $r=Assert-SafePath '{root/'hermes/hermes-agent'}'; $s=Read-Journal $h $r (Get-Content '{ROOT/'backend/upstream/commit.txt'}' -Raw).Trim() ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value); $s.revision='"+'0'*40+"'; Write-Journal $s"
+                    result=subprocess.run([PS,'-NoProfile','-Command',cmd],capture_output=True,timeout=10)
+                    self.assertEqual(result.returncode,0,result.stderr)
                 p=self.start(root,'complete'); out,err=p.communicate(timeout=30)
                 self.assertEqual(p.returncode,0,(out,err))
                 self.assertEqual(len((root/'pins.txt').read_text().splitlines()),2)

@@ -108,6 +108,70 @@ namespace HermesSetup
             if (fallbacks != null) foreach (var f in fallbacks) if (f != null) f.api_key = null;
         }
     }
+    // One action of the «Hermes уже установлен» screen. Only the fields that action accepts
+    // are serialized: the worker rejects any other field.
+    public sealed class MaintenanceRequest
+    {
+        public const string UpdateSet = "update_set", ForeignAddSet = "foreign_add_set", ChangeProvider = "change_provider",
+            AddBackups = "add_backups", TelegramConnect = "telegram_connect";
+        public string Action;
+        public Request Provider;          // change_provider: endpoint, key, model (validated like an install)
+        public string TelegramToken;      // telegram_connect
+        public List<FallbackEntry> Fallbacks;   // add_backups
+        public string PrimaryEndpoint;    // add_backups: never a backup of the current primary
+        public string Validate()
+        {
+            switch (Action)
+            {
+                case UpdateSet: case ForeignAddSet: return null;
+                case ChangeProvider:
+                    if (Provider == null) return "Выберите провайдера и вставьте ключ.";
+                    Provider.telegram_bot_token = null; Provider.fallbacks = null;
+                    return Provider.Validate();
+                case TelegramConnect:
+                {
+                    var tg = new StringBuilder();
+                    foreach (char c in TelegramToken ?? "") if (!Char.IsWhiteSpace(c) && !Char.IsControl(c) && c != '​') tg.Append(c);
+                    TelegramToken = tg.ToString();
+                    return Request.TelegramTokenShape.IsMatch(TelegramToken) ? null : "Токен Телеграм-бота выглядит неверно. Скопируйте его из @BotFather целиком (вида 123456789:AA…).";
+                }
+                case AddBackups:
+                {
+                    if (Fallbacks == null || Fallbacks.Count == 0) return "Добавьте хотя бы один запасной ключ.";
+                    var probe = new Request { endpoint = Request.NormalizeEndpoint(PrimaryEndpoint), fallbacks = Fallbacks };
+                    return probe.ValidateFallbacks();
+                }
+                default: return "Неизвестное действие.";
+            }
+        }
+        public Dictionary<string,object> Payload()
+        {
+            var payload = new Dictionary<string,object> { { "protocol", 1 }, { "action", Action } };
+            if (Action == ChangeProvider)
+            {
+                payload["endpoint"] = Provider.endpoint; payload["api_key"] = Provider.api_key;
+                if (!String.IsNullOrEmpty(Provider.model)) payload["model"] = Provider.model;
+                if (!String.IsNullOrEmpty(Provider.provider_name)) payload["provider_name"] = Provider.provider_name;
+            }
+            if (Action == TelegramConnect) payload["telegram_bot_token"] = TelegramToken;
+            if (Action == AddBackups) payload["fallbacks"] = Fallbacks;
+            return payload;
+        }
+        public string[] Secrets()
+        {
+            var list = new List<string>();
+            if (Provider != null) list.AddRange(Provider.Secrets());
+            if (!String.IsNullOrEmpty(TelegramToken)) list.Add(TelegramToken);
+            if (Fallbacks != null) foreach (var f in Fallbacks) if (f != null && !String.IsNullOrEmpty(f.api_key)) list.Add(f.api_key);
+            return list.ToArray();
+        }
+        public void ClearSecrets()
+        {
+            if (Provider != null) Provider.ClearSecrets();
+            TelegramToken = null;
+            if (Fallbacks != null) foreach (var f in Fallbacks) if (f != null) f.api_key = null;
+        }
+    }
     public static class WorkerClient
     {
         public static string Quote(string value)
@@ -138,7 +202,10 @@ namespace HermesSetup
                 // System (non-secret) variables. Without them the elevated Microsoft VC++
                 // redistributable exits 0x80070003 (path not found): voice notes and
                 // greenlet-based marketplaces then fail to load (sandbox 2026-09-23).
-                "SystemDrive", "ProgramW6432", "CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432", "USERNAME", "USERDOMAIN", "COMPUTERNAME", "HOMEDRIVE", "HOMEPATH", "PUBLIC" })
+                "SystemDrive", "ProgramW6432", "CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432", "USERNAME", "USERDOMAIN", "COMPUTERNAME", "HOMEDRIVE", "HOMEPATH", "PUBLIC",
+                // Network setup the person relies on (Windows names are case-insensitive): a proxy-only
+                // VPN and an antivirus/corporate CA would otherwise break every download.
+                "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "UV_NATIVE_TLS" })
             { string value=Environment.GetEnvironmentVariable(name); if(value!=null) inherited[name]=value; }
             psi.EnvironmentVariables.Clear();
             foreach(var entry in inherited) psi.EnvironmentVariables[entry.Key]=entry.Value;
@@ -219,14 +286,23 @@ namespace HermesSetup
                     await Task.Run(delegate { process.WaitForExit(15000); });
                     // Bounded drain: a descendant that broke away may still hold a pipe open.
                     await Task.WhenAny(Task.WhenAll(stdout, stderr), Task.Delay(5000));
-                    if(stop==Outcome.CodeCancelled) return Outcome.Failure(Outcome.CodeCancelled, StoppedMessage);
-                    return Outcome.Failure(Outcome.CodeTimeout, telegram ? "Телеграм не ответил вовремя, проверка остановлена. Повторите через минуту." : HungMessage);
+                    if(stop==Outcome.CodeCancelled) return AfterConfigured(protocol, Outcome.Failure(Outcome.CodeCancelled, StoppedMessage));
+                    return AfterConfigured(protocol, Outcome.Failure(Outcome.CodeTimeout, telegram ? "Телеграм не ответил вовремя, проверка остановлена. Повторите через минуту." : HungMessage));
                 }
                 job.Release();
                 await stdout;
                 if(await stderr || writeFailed) protocol.Invalidate();
-                return protocol.Finish(process.ExitCode);
+                return AfterConfigured(protocol, protocol.Finish(process.ExitCode));
             }
+        }
+        // The key was verified and saved before the stop/timeout/failure: the install is done and
+        // «Повторить» would only meet «Hermes уже установлен». End on the Done screen instead.
+        public static Outcome AfterConfigured(Protocol protocol, Outcome outcome)
+        {
+            if (outcome.Success || protocol.ConfiguredLaunchPath == null) return outcome;
+            string why = outcome.Cancelled ? " (установка остановлена)" : outcome.Code == Outcome.CodeTimeout ? " (установщик долго не отвечал)" : "";
+            return new Outcome { Success = true, Partial = true, LaunchPath = protocol.ConfiguredLaunchPath, LaunchArgs = new string[0],
+                Message = "Hermes установлен, ключ проверен. Необязательные шаги пропущены" + why + ": набор, Телеграм или запасные ключи можно добавить позже — откройте установщик снова." };
         }
         // Short Done-screen actions: "telegram_pending" (no arguments) or "telegram_approve"
         // (request id + user id picked by the owner's click). Same process contract as install:
@@ -247,6 +323,29 @@ namespace HermesSetup
             var protocol = new Protocol(null, delegate { }, delegate(string p, string[] a) { return false; }) { TelegramMode = true };
             byte[] bytes = new UTF8Encoding(false,true).GetBytes(new JavaScriptSerializer().Serialize(payload)+"\n");
             return await Execute(worker, bytes, protocol, true, CancellationToken.None, limit);
+        }
+        // «status» when the window opens: which screen to show. Reads only; bounded.
+        public static readonly TimeSpan StatusLimit = TimeSpan.FromSeconds(90);
+        public static Task<Outcome> RunStatusAsync(string worker) { return RunStatusAsync(worker, LaunchPolicy.Validate, StatusLimit); }
+        public static async Task<Outcome> RunStatusAsync(string worker, Func<string,string[],bool> validator, TimeSpan limit)
+        {
+            if(!File.Exists(worker)) return Outcome.Failure("INSTALL: Не найден backend/worker.ps1. Распакуйте весь ZIP в одну папку и запустите HermesSetup.exe оттуда.");
+            var protocol = new Protocol(null, delegate { }, validator) { StatusMode = true };
+            var payload = new Dictionary<string,object> { { "protocol", 1 }, { "action", "status" } };
+            byte[] bytes = new UTF8Encoding(false,true).GetBytes(new JavaScriptSerializer().Serialize(payload)+"\n");
+            return await Execute(worker, bytes, protocol, false, CancellationToken.None, limit);
+        }
+        // A maintenance action: progress records, then one {"type":"done"} or error. Like the install,
+        // the whole tree dies with the window or on cancel; silence past the install limit = hung.
+        public static async Task<Outcome> RunMaintenanceAsync(string worker, MaintenanceRequest request, Action<string> progress, CancellationToken cancel)
+        {
+            string error = request.Validate();
+            if(error!=null) return Outcome.Failure("INPUT", error);
+            if(!File.Exists(worker)) return Outcome.Failure("INSTALL: Не найден backend/worker.ps1. Распакуйте весь ZIP в одну папку и запустите HermesSetup.exe оттуда.");
+            var protocol = new Protocol(null, progress, delegate(string p, string[] a) { return false; }) { MaintenanceMode = true, ExtraSecrets = request.Secrets() };
+            byte[] bytes = new UTF8Encoding(false,true).GetBytes(new JavaScriptSerializer().Serialize(request.Payload())+"\n");
+            try { return await Execute(worker, bytes, protocol, false, cancel, InstallSilenceLimit); }
+            finally { Array.Clear(bytes,0,bytes.Length); }
         }
         static void ReadLines(StreamReader reader, Protocol protocol, long[] lastRecord)
         {

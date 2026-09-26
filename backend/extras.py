@@ -2,18 +2,29 @@
 
 `extras.py HOME REPO ASSETS --marketplaces` runs only the marketplaces MCP step
 (download + uv sync + stdio probe), a separate worker step with its own budget.
+`extras.py HOME REPO ASSETS --status` only reads: set version, model block,
+Telegram and backups for the «Hermes уже установлен» screen (no secrets).
+
+The same run serves a first install, «Обновить набор» and «Добавить набор» to a
+Hermes this installer did not install. What the set installed is recorded in
+HOME/.subscriber-set.json (set version, digest of SOUL.md and of every skill
+folder). A later run replaces only copies that still match such a digest (or
+any version this repository ever shipped, for installs older than the marker):
+a file the user edited is theirs and is never overwritten.
 
 One JSON report on stdout, fixed Russian messages, no exception escapes the
 boundary. Each part is independent: one failure never cancels the others. This
-module writes SOUL.md, skills and config.yaml only; it never touches .env or any
-credential. Style mirrors configure.py (Failure, atomic_write, protect).
+module writes SOUL.md, skills, config.yaml and the set marker only; it never
+touches .env or any credential. Style mirrors configure.py (Failure, atomic_write, protect).
 """
+import hashlib
 import http.client
 import importlib
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -23,6 +34,13 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from provider import Failure, tls_context
+
+# The version of the out-of-box set this package ships. The UI offers «Обновить набор»
+# when HOME/.subscriber-set.json records an older one (or none).
+SET_VERSION = '0.1.3'
+SET_MARKER = '.subscriber-set.json'
+# Digests of every SOUL.md / skill version this repository shipped (tools/shipped_history.py).
+HISTORY = 'shipped-history.json'
 
 # Keyless endpoints verified by the orchestrator on 2026-09-22 (initialize -> HTTP 200).
 MCP_SERVERS = (
@@ -87,7 +105,96 @@ def load_default_soul(repo):
     return DEFAULT_SOUL_MD, is_legacy_template_soul
 
 
-def step_soul(home, assets, repo):
+# --- Ownership of what the set installed ---------------------------------------
+# A digest identifies content, not a path: CRLF is folded to LF (a package built
+# from an autocrlf checkout equals the committed file) and runtime byproducts
+# (__pycache__, *.pyc) are not part of a skill.
+
+def content_hash(data):
+    return hashlib.sha256(data.replace(b'\r\n', b'\n')).hexdigest()
+
+
+def digest_rows(rows):
+    """One digest of {relative posix path: content_hash}."""
+    digest = hashlib.sha256()
+    for rel in sorted(rows):
+        digest.update(rel.encode('utf-8') + b'\0' + rows[rel].encode('ascii') + b'\n')
+    return digest.hexdigest()
+
+
+def skipped_part(parts):
+    return '__pycache__' in parts or parts[-1].endswith('.pyc')
+
+
+def is_link(path):
+    """Symlink or junction (or unreadable): never ours to replace or follow."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return True
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def tree_digest(folder):
+    """Digest of every file under folder; None when it is or holds a link/junction."""
+    folder = Path(folder)
+    if is_link(folder) or not folder.is_dir():
+        return None
+    rows = {}
+    for current, dirs, names in os.walk(folder):
+        if any(is_link(Path(current) / name) for name in dirs + names):
+            return None
+        for name in names:
+            path = Path(current) / name
+            rel = path.relative_to(folder).as_posix()
+            if not skipped_part(rel.split('/')):
+                rows[rel] = content_hash(path.read_bytes())
+    return digest_rows(rows)
+
+
+def marker_path(home):
+    return Path(home) / SET_MARKER
+
+
+def read_marker(home):
+    """{'set_version': str, 'soul': digest|None, 'skills': {name: digest}}; empty when absent or damaged."""
+    try:
+        data = json.loads(marker_path(home).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        data = None
+    data = data if isinstance(data, dict) else {}
+    version = data.get('set_version')
+    soul = data.get('soul')
+    skills = data.get('skills') if isinstance(data.get('skills'), dict) else {}
+    return {'set_version': version if isinstance(version, str) and valid_version(version) else '',
+            'soul': soul if isinstance(soul, str) and len(soul) == 64 else None,
+            'skills': {k: v for k, v in skills.items() if isinstance(k, str) and isinstance(v, str) and len(v) == 64}}
+
+
+def valid_version(text):
+    import re
+    return re.fullmatch(r'[0-9]{1,4}(\.[0-9]{1,4}){0,3}', text) is not None
+
+
+def write_marker(home, marker):
+    body = {'schema': 1, 'set_version': marker['set_version'], 'soul': marker['soul'], 'skills': marker['skills']}
+    atomic_write(marker_path(home), (json.dumps(body, indent=1, sort_keys=True) + '\n').encode('utf-8'))
+
+
+def read_history(assets):
+    try:
+        data = json.loads((Path(assets) / 'skills' / HISTORY).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        data = None
+    data = data if isinstance(data, dict) else {}
+    skills = data.get('skills') if isinstance(data.get('skills'), dict) else {}
+    return {'soul': set(d for d in data.get('soul') or [] if isinstance(d, str)),
+            'skills': {k: set(d for d in v if isinstance(d, str)) for k, v in skills.items() if isinstance(v, list)}}
+
+
+def step_soul(home, assets, repo, owned=()):
+    """SOUL.md: installed when absent; replaced when it is Hermes' default/legacy
+    scaffold or an untouched copy of an earlier set (digest in `owned`)."""
     source = Path(assets) / 'SOUL.md'
     target = Path(home) / 'SOUL.md'
     if not source.is_file():
@@ -96,6 +203,12 @@ def step_soul(home, assets, repo):
     if not target.exists():
         atomic_write(target, payload)
         return 'installed'
+    current = content_hash(target.read_bytes())
+    if current == content_hash(payload):
+        return 'kept'
+    if current in owned:
+        atomic_write(target, payload)
+        return 'updated'
     default_soul, is_legacy = load_default_soul(repo)
     existing = target.read_text(encoding='utf-8')
     if existing == default_soul or is_legacy(existing):
@@ -104,22 +217,73 @@ def step_soul(home, assets, repo):
     return 'kept'
 
 
-def step_skills(home, assets):
-    # Every shipped skill folder is copied only when the user has no folder of
-    # that name: an existing one, identical or not, is the user's and never
-    # overwritten. 'installed' if at least one landed, 'kept' if all existed.
+def replace_tree(source, target, expected, home):
+    """Swap an untouched skill folder for the shipped one. The new copy is staged
+    outside skills/ (Hermes never loads a half-copied skill); the old folder is
+    renamed aside and restored if the swap fails. Raises on any failure."""
+    tag = uuid.uuid4().hex[:8]
+    staging = Path(home) / ('.subscriber-skill-' + tag)
+    aside = Path(home) / ('.subscriber-skill-old-' + tag)
+    try:
+        shutil.copytree(source, staging)
+        # Re-checked right before the swap: an edit made meanwhile makes it the user's.
+        if tree_digest(target) != expected:
+            raise Failure('EXTRAS', 'Навык изменён во время обновления; он сохранён как есть.')
+        os.replace(target, aside)
+        try:
+            os.replace(staging, target)
+        except Exception:
+            os.replace(aside, target)
+            raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    shutil.rmtree(aside, ignore_errors=True)
+
+
+def step_skills(home, assets, owned=None, record=None):
+    """Every shipped skill folder:
+      * absent: copied, unless the marker says the set installed it before (the user removed it);
+      * identical to the shipped one: kept;
+      * an untouched copy of an earlier set (its digest is in `owned`): replaced;
+      * anything else (edited, the user's own, a link): never touched.
+    `record` ({name: digest}, the marker's) is updated with what the set now owns.
+    'installed' if at least one landed, 'kept' if nothing changed, 'failed' when a
+    replacement failed (e.g. a file locked by a running Hermes; the old folder stays)."""
+    owned = owned or {}
+    record = {} if record is None else record
     root = Path(assets) / 'skills'
     sources = sorted(p for p in root.iterdir() if p.is_dir() and (p / 'SKILL.md').is_file()) if root.is_dir() else []
     if not sources:
         return 'failed'
-    installed = False
+    installed = failed = False
     for source in sources:
         target = Path(home) / 'skills' / source.name
-        if target.exists():
+        shipped = tree_digest(source)
+        if not os.path.lexists(target):
+            if source.name in record:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source, target)
+            record[source.name] = shipped
+            installed = True
             continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source, target)
+        current = tree_digest(target)
+        if current is None:
+            continue
+        if current == shipped:
+            record[source.name] = shipped
+            continue
+        if current not in owned.get(source.name, ()):
+            continue
+        try:
+            replace_tree(source, target, current, home)
+        except Exception:
+            failed = True
+            continue
+        record[source.name] = shipped
         installed = True
+    if failed:
+        return 'failed'
     return 'installed' if installed else 'kept'
 
 
@@ -291,8 +455,19 @@ PYTHON_BUILDS_URL = 'https://github.com/astral-sh/python-build-standalone/releas
 MARKETPLACES_PYTHON_MIRRORS = (None, 'https://ghproxy.net/' + PYTHON_BUILDS_URL, 'https://gh-proxy.com/' + PYTHON_BUILDS_URL)
 MARKETPLACES_PYTHON_ATTEMPT_TIMEOUT = 240
 # Inherited settings that would redirect the download or replace uv's hash source.
+# Also every package-index override, an insecure host, a config file and a replaced CA bundle:
+# `uv sync --frozen` must fetch the locked packages from the lock's own index, over verified TLS
+# (UV_NATIVE_TLS, the Windows store, stays allowed for antivirus/corporate TLS inspection).
 UV_ENV_DROP = ('VIRTUAL_ENV', 'UV_PROJECT_ENVIRONMENT', 'PYTHONHOME', 'PYTHONPATH',
-               'UV_PYTHON_INSTALL_MIRROR', 'UV_PYTHON_DOWNLOADS_JSON_URL', 'UV_PYTHON_DOWNLOADS')
+               'UV_PYTHON_INSTALL_MIRROR', 'UV_PYTHON_DOWNLOADS_JSON_URL', 'UV_PYTHON_DOWNLOADS',
+               'UV_EXTRA_INDEX_URL', 'UV_DEFAULT_INDEX', 'UV_FIND_LINKS', 'UV_INSECURE_HOST', 'UV_CONFIG_FILE', 'SSL_CERT_FILE')
+UV_ENV_DROP_PREFIXES = ('UV_INDEX',)
+
+
+def uv_env():
+    """os.environ without the settings above (UV_INDEX, UV_INDEX_URL, UV_INDEX_<NAME>_* too)."""
+    return {k: v for k, v in os.environ.items()
+            if k.upper() not in UV_ENV_DROP and not k.upper().startswith(UV_ENV_DROP_PREFIXES)}
 MARKETPLACES_SOURCES = 'ozon,avito,yandex_market,detsky_mir,compare'
 MARKETPLACES_ENTRY = 'marketplace_connector.__main__:main'
 MARKETPLACES_LAUNCHER = ('direct_launcher.py', 'direct_common.py', 'direct_proxy.py', 'wb_browser_mcp.py')
@@ -508,7 +683,7 @@ def install_marketplaces(home, assets, fetch=None, runner=None, uv=None, manifes
             shutil.rmtree(work, ignore_errors=True)
         # Marker first ('pending'): a later retry may remove this folder as ours.
         marker.write_text('pending', encoding='utf-8')
-        env = {k: v for k, v in os.environ.items() if k.upper() not in UV_ENV_DROP}
+        env = uv_env()
         env['UV_PYTHON_PREFERENCE'] = 'managed'
         deadline = time.monotonic() + MARKETPLACES_SYNC_TIMEOUT
         ensure_python(uv, repo, env, runner, deadline)
@@ -516,7 +691,8 @@ def install_marketplaces(home, assets, fetch=None, runner=None, uv=None, manifes
         # proxy-less download (it can still use a system 3.12 if the install failed).
         sync_env = dict(env, UV_PYTHON_DOWNLOADS='never')
         try:
-            code = runner([uv, 'sync', '--frozen', '--no-dev', '--package', 'marketplace-connector', '--python', MARKETPLACES_PYTHON],
+            # --no-config: no uv.toml / [tool.uv] settings (indexes, hosts) from the user or the tree.
+            code = runner([uv, 'sync', '--frozen', '--no-config', '--no-dev', '--package', 'marketplace-connector', '--python', MARKETPLACES_PYTHON],
                           repo, max(30, deadline - time.monotonic()), sync_env)
         except subprocess.TimeoutExpired:
             code = None
@@ -820,12 +996,21 @@ def main(home, repo, assets, probe=None):
     home = Path(home)
     result = {'ok': True, 'soul': 'failed', 'skills': 'failed',
               'mcp': {name: 'failed' for name, _ in MCP_SERVERS}}
+    marker = read_marker(home)
+    history = read_history(assets)
+    owned_soul = set(history['soul'])
+    if marker['soul']:
+        owned_soul.add(marker['soul'])
+    owned_skills = {name: set(digests) for name, digests in history['skills'].items()}
+    for name, digest in marker['skills'].items():
+        owned_skills.setdefault(name, set()).add(digest)
+    record = dict(marker['skills'])
     try:
-        result['soul'] = step_soul(home, assets, repo)
+        result['soul'] = step_soul(home, assets, repo, owned_soul)
     except Exception:
         result['soul'] = 'failed'
     try:
-        result['skills'] = step_skills(home, assets)
+        result['skills'] = step_skills(home, assets, owned_skills, record)
     except Exception:
         result['skills'] = 'failed'
     try:
@@ -850,7 +1035,46 @@ def main(home, repo, assets, probe=None):
                     and result.get('busy') != 'failed' and result.get('stt_language') != 'failed'
                     and result.get('api_retries') != 'failed'
                     and all(v != 'failed' for v in result['mcp'].values()))
+    # Ownership is recorded even after a partial run; the version only after a
+    # complete one, so the UI keeps offering «Обновить набор» until it lands.
+    try:
+        soul_path, source = home / 'SOUL.md', Path(assets) / 'SOUL.md'
+        soul = marker['soul']
+        if soul_path.is_file() and source.is_file() and content_hash(soul_path.read_bytes()) == content_hash(source.read_bytes()):
+            soul = content_hash(source.read_bytes())
+        write_marker(home, {'set_version': SET_VERSION if result['ok'] else marker['set_version'],
+                            'soul': soul, 'skills': record})
+        result['set_version'] = SET_VERSION if result['ok'] else marker['set_version']
+    except Exception:
+        result['set_version'] = marker['set_version']
     return result
+
+
+def status_report(home):
+    """What the maintenance screen shows. Never a secret: the key and the bot token
+    are only tested for presence; base_url/model are the provider's public address."""
+    import yaml
+    from dotenv import dotenv_values
+    from configure import model_block_is_ours, CHANGE_PENDING
+    home = Path(home)
+    report = {'ok': True, 'set_version': read_marker(home)['set_version'], 'package_set_version': SET_VERSION, 'model_ours': False,
+              'base_url': '', 'model': '', 'telegram': False, 'backups': 0,
+              'change_interrupted': (home / CHANGE_PENDING).exists()}
+    config_path, env_path = home / 'config.yaml', home / '.env'
+    cfg = yaml.safe_load(config_path.read_bytes().decode('utf-8-sig')) if config_path.is_file() else {}
+    cfg = cfg if isinstance(cfg, dict) else {}
+    block = cfg.get('model')
+    if isinstance(block, dict):
+        report['model_ours'] = model_block_is_ours(block)
+        if isinstance(block.get('base_url'), str):
+            report['base_url'] = block['base_url']
+        if isinstance(block.get('default'), str):
+            report['model'] = block['default']
+    chain = cfg.get('fallback_providers')
+    report['backups'] = len(chain) if isinstance(chain, list) else 0
+    env = dotenv_values(env_path) if env_path.is_file() else {}
+    report['telegram'] = bool(env.get('TELEGRAM_BOT_TOKEN'))
+    return report
 
 
 if __name__ == '__main__':
@@ -861,6 +1085,8 @@ if __name__ == '__main__':
         if sys.argv[4:5] == ['--marketplaces']:
             # Own worker step with its own budget: download + uv sync can take minutes.
             output = main_marketplaces(Path(sys.argv[1]), Path(sys.argv[3]))
+        elif sys.argv[4:5] == ['--status']:
+            output = status_report(Path(sys.argv[1]))
         else:
             output = main(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))
     except Exception:

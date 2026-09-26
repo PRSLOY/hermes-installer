@@ -159,7 +159,7 @@ try {
     if ($problem) { [Console]::WriteLine('PROBLEM ' + $problem) } else { [Console]::WriteLine('MATCH ' + $exp.Count) }
 } catch { [Console]::WriteLine('THROW ' + $_.Exception.Message) }
 '''.replace('MANIFEST', str(manifest)).replace('COMMIT', COMMIT).replace('TREE', str(tree))
-            code, out = run_ps(body, ['Read-HermesTreeManifest', 'Test-HermesTreeManifest'], tmp)
+            code, out = run_ps(body, ['Read-HermesTreeManifest', 'Test-HermesTreeManifest', 'New-PrivateExtractDir'], tmp)
             self.assertEqual(code, 0, out)
             return out
 
@@ -228,13 +228,14 @@ try {
 BLOCK
     [Console]::WriteLine('USED ' + $extractedDir.Name)
     [Console]::WriteLine('README ' + (Test-Path (Join-Path $extractedDir.FullName 'README.md')))
+    [Console]::WriteLine('PROTECTED ' + [IO.Directory]::GetAccessControl($extractPath).AreAccessRulesProtected)
 } catch { [Console]::WriteLine('THROW ' + $_.Exception.Message) }
 '''
             proxies = ','.join("'src%d'" % i for i in range(1, len(served)))
             zipmap = '; '.join("'%s' = '%s'" % (k, v) for k, v in zips.items())
             body = (body.replace('BLOCK', block).replace('COMMIT', COMMIT).replace('TMP', tmp)
                     .replace('MANIFEST', str(manifest)).replace('PROXIES', proxies).replace('ZIPMAP', zipmap))
-            code, out = run_ps(body, ['Read-HermesTreeManifest', 'Test-HermesTreeManifest'], tmp)
+            code, out = run_ps(body, ['Read-HermesTreeManifest', 'Test-HermesTreeManifest', 'New-PrivateExtractDir'], tmp)
             self.assertEqual(code, 0, out)
             return out
 
@@ -245,6 +246,8 @@ BLOCK
         self.assertIn('FETCH src1', out)
         self.assertIn('USED hermes-agent-%s' % COMMIT, out)
         self.assertIn('does not match the verified file list', out)
+        # Extracted under a protected DACL: C:\\ lets every account modify new folders.
+        self.assertIn('PROTECTED True', out)
 
     def test_every_source_tampered_fails_closed(self):
         evil = dict(FILES, **{'extra.py': b'x\n'})
