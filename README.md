@@ -96,5 +96,5 @@ powershell -File tests\ui\run.ps1      # тесты интерфейса; зап
 
 ## Лицензия
 
-MIT. Hermes Agent (Nous Research) и ru-marketplace-mcp (Vladimir-Human) тоже
+MIT. Hermes Agent (Nous Research), ru-marketplace-mcp (Vladimir-Human) и навыки kisa-stack (howdeploy), по мотивам которых сделаны ресерч, голосовые и память переписок, тоже
 распространяются по MIT.
