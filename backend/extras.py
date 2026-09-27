@@ -37,7 +37,7 @@ from provider import Failure, tls_context
 
 # The version of the out-of-box set this package ships. The UI offers «Обновить набор»
 # when HOME/.subscriber-set.json records an older one (or none).
-SET_VERSION = '0.1.3'
+SET_VERSION = '0.1.4'
 SET_MARKER = '.subscriber-set.json'
 # Digests of every SOUL.md / skill version this repository shipped (tools/shipped_history.py).
 HISTORY = 'shipped-history.json'
